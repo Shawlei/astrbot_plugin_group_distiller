@@ -85,6 +85,9 @@ class RuntimeState:
         self.today_new = 0
         self.today_date = ""
         self.overview: dict[str, dict[str, int]] = {}
+        # 群号 -> 该群最近一次出现过的 unified_msg_origin。
+        # 每日定时总结要在群里播报时用它，避免自己拼 umo 拼错。
+        self.last_umo: dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # 目标集合
@@ -263,6 +266,26 @@ class RuntimeState:
             self.today_new = 0
         self.today_new += 1
 
+    # ------------------------------------------------------------------ #
+    # 会话来源（每日总结播报用）
+    # ------------------------------------------------------------------ #
+
+    def note_umo(self, group_id: str, umo: str) -> None:
+        """记录某个群最近出现过的会话来源（``unified_msg_origin``）。"""
+        if group_id and umo:
+            self.last_umo[str(group_id)] = str(umo)
+
+    def umo_for(self, group_id: str, platform: str = "aiocqhttp") -> str:
+        """取某个群的会话来源。
+
+        优先用采集时真实见过的；没见过（比如刚重启）就按 AstrBot 的
+        ``platform:message_type:session_id`` 格式兜底拼一个。
+        """
+        known = self.last_umo.get(str(group_id))
+        if known:
+            return known
+        return f"{platform}:GroupMessage:{group_id}"
+
 
 class Collector:
     """静默采集器。"""
@@ -380,6 +403,11 @@ class Collector:
         group_targets = self.state.targets_in_group(group_id)
         if not group_targets:
             return
+
+        try:
+            self.state.note_umo(group_id, getattr(event, "unified_msg_origin", "") or "")
+        except Exception:  # noqa: BLE001 - 记来源失败不影响采集
+            pass
 
         try:
             sender_id = str(event.get_sender_id() or "")

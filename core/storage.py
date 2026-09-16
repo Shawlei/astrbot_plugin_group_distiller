@@ -386,6 +386,93 @@ class Storage:
             logger.error("[%s] 读取未蒸馏语料失败: %s", PLUGIN_NAME, exc)
             return []
 
+    async def fetch_range(
+        self, group_id: str, qq: str, start_ts: int, end_ts: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """取某时间区间内该目标的全部语料（含归属它的上下文）。
+
+        与 :meth:`fetch_undistilled` 的区别：**不看 distilled 标记**。每日总结要的
+        是"这一天聊过的所有内容"，即使其中一部分已经被盘中的自动蒸馏处理过，
+        也要重新过一遍 —— 那才是"总结今天"。
+
+        Args:
+            group_id: 群号。
+            qq: 目标 QQ。
+            start_ts: 区间起点（含）。
+            end_ts: 区间终点（含）。
+            limit: 最多返回多少条。
+
+        Returns:
+            按时间升序的语料行。
+        """
+        return await self._run(
+            self._fetch_range_sync, group_id, qq, start_ts, end_ts, limit
+        )
+
+    def _fetch_range_sync(
+        self, group_id: str, qq: str, start_ts: int, end_ts: int, limit: int
+    ) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        try:
+            cur = self._conn.execute(
+                """
+                SELECT id, message_id, speaker_qq, speaker_name, content,
+                       timestamp, is_context, context_for_qq
+                FROM messages
+                WHERE group_id = ?
+                      AND timestamp >= ? AND timestamp <= ?
+                      AND (
+                            speaker_qq = ?
+                            OR (
+                                is_context = 1
+                                AND (context_for_qq = '' OR context_for_qq = ?)
+                            )
+                          )
+                ORDER BY timestamp ASC, id ASC
+                LIMIT ?
+                """,
+                (
+                    group_id,
+                    int(start_ts),
+                    int(end_ts),
+                    qq,
+                    qq,
+                    max(1, int(limit)),
+                ),
+            )
+            return [dict(row) for row in cur.fetchall()]
+        except sqlite3.Error as exc:
+            logger.error("[%s] 读取区间语料失败: %s", PLUGIN_NAME, exc)
+            return []
+
+    async def count_range(
+        self, group_id: str, qq: str, start_ts: int, end_ts: int
+    ) -> int:
+        """统计某时间区间内该目标的语料条数（不含上下文行）。"""
+        return await self._run(
+            self._count_range_sync, group_id, qq, start_ts, end_ts
+        )
+
+    def _count_range_sync(
+        self, group_id: str, qq: str, start_ts: int, end_ts: int
+    ) -> int:
+        if self._conn is None:
+            return 0
+        try:
+            cur = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM messages
+                WHERE group_id = ? AND speaker_qq = ? AND is_context = 0
+                      AND timestamp >= ? AND timestamp <= ?
+                """,
+                (group_id, qq, int(start_ts), int(end_ts)),
+            )
+            return int(cur.fetchone()["c"])
+        except sqlite3.Error as exc:
+            logger.error("[%s] 统计区间语料失败: %s", PLUGIN_NAME, exc)
+            return 0
+
     async def mark_distilled(self, ids: list[int]) -> int:
         """把给定 id 的语料标记为已蒸馏。"""
         if not ids:

@@ -14,6 +14,7 @@ from . import (
     persona_bridge,
     progress,
     prompts,
+    schedule,
     storage,
     targets,
 )
@@ -46,6 +47,13 @@ from .progress import (
     render_target_list,
 )
 from .storage import MessageRecord, Storage, resolve_plugin_data_dir
+from .schedule import (
+    DailyDigestScheduler,
+    day_start_ts,
+    date_str,
+    format_hhmm,
+    parse_hhmm,
+)
 from .targets import (
     TargetSpec,
     collect_config_targets,
@@ -64,6 +72,7 @@ __all__ = [
     "persona_bridge",
     "progress",
     "prompts",
+    "schedule",
     "storage",
     "targets",
     # 目标
@@ -92,6 +101,12 @@ __all__ = [
     "persona_supported",
     "persona_exists",
     "export_persona_file",
+    # 每日定时总结
+    "DailyDigestScheduler",
+    "parse_hhmm",
+    "format_hhmm",
+    "day_start_ts",
+    "date_str",
     # 进度渲染
     "PanelData",
     "TargetRow",

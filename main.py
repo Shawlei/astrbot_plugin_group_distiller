@@ -12,6 +12,7 @@ AstrBot 的「人格设定」。
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,8 +21,14 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
+try:  # MessageChain 用于"主动发消息"（每日总结播报），缺失时该功能优雅降级
+    from astrbot.api.event import MessageChain  # type: ignore
+except ImportError:  # pragma: no cover - 仅在精简/老版本环境触发
+    MessageChain = None  # type: ignore
+
 try:  # 兼容包内导入 / 顶层导入两种加载方式
-    from .core import persona_bridge, progress, prompts, targets as targets_mod
+    from .core import persona_bridge, progress, prompts, schedule
+    from .core import targets as targets_mod
     from .core.collector import Collector, RuntimeState
     from .core.distiller import (
         Distiller,
@@ -29,10 +36,12 @@ try:  # 兼容包内导入 / 顶层导入两种加载方式
         count_formed_layers,
         empty_snapshot,
     )
+    from .core.schedule import DailyDigestScheduler, format_hhmm
     from .core.storage import Storage, resolve_plugin_data_dir
     from .core.targets import TargetSpec
 except ImportError:  # pragma: no cover
     from core import persona_bridge, progress, prompts  # type: ignore
+    from core import schedule  # type: ignore
     from core import targets as targets_mod  # type: ignore
     from core.collector import Collector, RuntimeState  # type: ignore
     from core.distiller import (  # type: ignore
@@ -41,6 +50,7 @@ except ImportError:  # pragma: no cover
         count_formed_layers,
         empty_snapshot,
     )
+    from core.schedule import DailyDigestScheduler, format_hhmm  # type: ignore
     from core.storage import Storage, resolve_plugin_data_dir  # type: ignore
     from core.targets import TargetSpec  # type: ignore
 
@@ -111,19 +121,39 @@ class GroupDistillerPlugin(Star):
         self.distiller = Distiller(
             self.storage, self.config, self.state, self.context, PLUGIN_NAME
         )
+        # 每日定时总结：读配置 → 到点回调 main 的 _run_daily_digest
+        self.scheduler = DailyDigestScheduler(
+            self._daily_cfg, self._run_daily_digest, PLUGIN_NAME
+        )
+        self.scheduler.set_state_hook(self._persist_digest_date)
 
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
 
     async def initialize(self) -> None:
-        """插件实例化后自动调用：初始化存储、加载目标、启动采集。"""
+        """插件实例化后自动调用：初始化存储、加载目标、启动采集与每日定时总结。"""
         try:
             await self.storage.init()
             await self._load_runtime_state()
             await self._refresh_counts()
             self.distiller.set_on_distilled(self._on_distilled)
             await self.collector.start()
+
+            daily = self._daily_cfg()
+            self.scheduler.restore_last_date(
+                await self.storage.get_state("rt_digest_last_date")
+            )
+            if daily["enabled"]:
+                await self.scheduler.start()
+                logger.info(
+                    "[%s] 每日定时总结已启用：每天 %s（当日最少 %d 条；上次：%s）",
+                    PLUGIN_NAME,
+                    daily["display_time"],
+                    daily["min_messages"],
+                    self.scheduler.last_date() or "无记录",
+                )
+
             logger.info(
                 "[%s] %s 初始化完成：%d 个目标，当前 %s",
                 PLUGIN_NAME,
@@ -138,6 +168,10 @@ class GroupDistillerPlugin(Star):
 
     async def terminate(self) -> None:
         """插件卸载/停用时调用：落盘、取消后台任务、关闭连接。"""
+        try:
+            await self.scheduler.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] 停止每日总结调度器失败: %s", PLUGIN_NAME, exc)
         try:
             await self.collector.stop()
         except Exception as exc:  # noqa: BLE001
@@ -226,6 +260,10 @@ class GroupDistillerPlugin(Star):
                     event.unified_msg_origin, manual=True, all_targets=all_targets
                 )
                 yield self._reply(event, result.message)
+
+            elif head in ("digest", "总结", "日报", "每日总结"):
+                async for reply in self._handle_digest(event, rest):
+                    yield reply
 
             elif head in ("profile", "档案", "画像"):
                 snapshot = await self._load_snapshot()
@@ -467,6 +505,142 @@ class GroupDistillerPlugin(Star):
             )
 
     # ------------------------------------------------------------------ #
+    # 每日定时总结
+    # ------------------------------------------------------------------ #
+
+    async def _handle_digest(self, event: AstrMessageEvent, rest: str):
+        """``/zl digest [all]``：立刻跑一次「每日总结」（用当天的全部对话）。"""
+        specs = self.state.collect_targets()
+        if not specs:
+            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。")
+            return
+        if self.distiller.is_running():
+            yield self._reply(event, "⏳ 已有蒸馏正在进行，等它跑完再试。")
+            return
+
+        scope_all = rest.strip().lower() in ("all", "全部", "所有", "全")
+        scope = "全部 %d 个目标" % len(specs) if scope_all else self._reply_scope()
+        umo = event.unified_msg_origin
+
+        # 蒸馏可能耗时（要调 LLM），扔后台跑，先立刻回执，跑完再回报结果
+        asyncio.create_task(self._daily_digest_then_report(umo, scope_all))
+        yield self._reply(
+            event,
+            f"🔬 已开始跑每日总结（{scope}，使用今天的全部对话）。\n"
+            "完成后我会回一条结果。",
+        )
+
+    def _reply_scope(self) -> str:
+        """当前目标的简短描述，用于回执文案。"""
+        active = self.state.active_target()
+        return active.label() if active else "当前目标"
+
+    async def _daily_digest_then_report(self, umo: str, scope_all: bool) -> None:
+        """后台执行每日总结，并把结果回发到发起会话。"""
+        now = int(time.time())
+        day_start = schedule.day_start_ts(now)
+        try:
+            if scope_all:
+                ok, detail = await self.distiller.run_daily_digest(
+                    self._umo_for, day_start, now, min_messages=0
+                )
+            else:
+                spec = self.state.active_target()
+                if spec is None:
+                    ok, detail = True, "没有配置目标"
+                else:
+                    ok, detail = await self.distiller.digest_day(
+                        umo, spec, day_start, now, min_messages=0
+                    )
+            await self._refresh_counts()
+            await self._send_text(
+                umo,
+                f"{'✅' if ok else '⚠️'} 每日总结（{schedule.date_str(now)}）：{detail}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] 手动每日总结失败: %s", PLUGIN_NAME, exc, exc_info=True)
+            await self._send_text(umo, "😵 每日总结出错，详见后台日志。")
+
+    def _daily_cfg(self) -> dict[str, Any]:
+        """读取并规整「每日定时总结」配置。"""
+        raw = self.config.get("daily_digest")
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "time": str(raw.get("time", "") or ""),
+            "display_time": format_hhmm(raw.get("time", "")),
+            "min_messages": self._safe_int(raw.get("min_messages", 5), 5),
+            "notify": bool(raw.get("notify", False)),
+        }
+
+    def _umo_for(self, spec: TargetSpec) -> str:
+        """某目标该往哪个会话播报（优先用采集时真实见过的 umo）。"""
+        return self.state.umo_for(spec.group_id)
+
+    async def _run_daily_digest(self, now: float, day_start: int) -> bool:
+        """调度器到点时的回调：对全部目标跑一次当日总结。
+
+        Returns:
+            True 表示处理完毕（不必重试）；False 表示遇到可重试的故障。
+        """
+        daily = self._daily_cfg()
+        if not self.state.collect_targets():
+            logger.info("[%s] 每日总结跳过：没有配置任何目标。", PLUGIN_NAME)
+            return True
+
+        items = await self.distiller.run_daily_digest_detailed(
+            self._umo_for, day_start, int(now), min_messages=daily["min_messages"]
+        )
+        await self._refresh_counts()
+
+        summary = "；".join(
+            f"{item.spec.display_name}({item.spec.qq_id})：{item.detail}"
+            for item in items
+        )
+        logger.info(
+            "[%s] 每日总结（%s）结果：%s", PLUGIN_NAME, schedule.date_str(now), summary
+        )
+
+        if daily["notify"]:
+            await self._broadcast_digest(items)
+
+        return all(item.ok for item in items) if items else True
+
+    async def _broadcast_digest(self, items: list[Any]) -> None:
+        """把每日总结结果播报到各目标所在的群（可选功能）。
+
+        **逐目标发**：每个群只收到自己群里那些目标的结果，不把别的群的信息
+        串过去。
+        """
+        for item in items:
+            spec = item.spec
+            head = "✅ 今日蒸馏总结完成" if item.ok else "⚠️ 今日蒸馏总结有异常"
+            await self._send_text(
+                self._umo_for(spec), f"{head}\n{spec.display_name}({spec.qq_id})：{item.detail}"
+            )
+
+    async def _send_text(self, umo: str, text: str) -> None:
+        """主动往某个会话发一条纯文本（失败只记日志，绝不外抛）。"""
+        if not umo:
+            return
+        if MessageChain is None:
+            # 当前环境没导出 MessageChain（罕见），放弃播报而不是让插件崩
+            logger.debug("[%s] 缺少 MessageChain，跳过主动播报。", PLUGIN_NAME)
+            return
+        try:
+            await self.context.send_message(umo, MessageChain().message(text))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] 主动发送消息失败: %s", PLUGIN_NAME, exc)
+
+    async def _persist_digest_date(self, date: str) -> None:
+        """持久化「每日总结上次完成日期」，避免重启后重复触发。"""
+        try:
+            await self.storage.set_state("rt_digest_last_date", str(date or ""))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] 写入每日总结日期失败: %s", PLUGIN_NAME, exc)
+
+    # ------------------------------------------------------------------ #
     # 其他子命令
     # ------------------------------------------------------------------ #
 
@@ -555,6 +729,8 @@ class GroupDistillerPlugin(Star):
         if len(specs) > 1:
             rows = await self._build_rows(specs, active.key)
 
+        daily = self._daily_cfg()
+
         data = progress.PanelData(
             plugin_name=PLUGIN_DISPLAY,
             has_target=True,
@@ -574,6 +750,9 @@ class GroupDistillerPlugin(Star):
             formed_layers=count_formed_layers(snapshot),
             total_layers=len(prompts.LAYER_KEYS),
             targets=rows,
+            daily_enabled=daily["enabled"],
+            daily_time=daily["display_time"],
+            daily_last=self.scheduler.last_result(),
         )
         return progress.render_panel(data)
 

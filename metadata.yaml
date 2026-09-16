@@ -2,10 +2,10 @@
 name: astrbot_plugin_group_distiller
 # 展示名（需要 AstrBot >= v4.5.0，低版本不会报错）
 display_name: 我要蒸馏群友
-desc: 静默采集多个「指定群 + 指定群友」的聊天语料，用 LLM 蒸馏成 5 层 AI 人格档案；群内 /zl 查进度与目标清单，并支持把蒸馏结果一键写进 AstrBot 的人格设定。
-short_desc: 把群友蒸馏成人格档案：多目标采集 + /zl 进度 + 一键写入 AstrBot 人格
+desc: 静默采集多个「指定群 + 指定群友」的聊天语料，用 LLM 蒸馏成 5 层 AI 人格档案；群内 /zl 查进度与目标清单，可设定每天定时用当天全部对话自动总结，并把蒸馏结果一键写进 AstrBot 的人格设定。
+short_desc: 把群友蒸馏成人格档案：多目标 + 每日定时总结 + /zl 进度 + 一键写入 AstrBot 人格
 # 插件版本号，格式：v1.1.1 或 v1.1
-version: v0.2.0
+version: v0.3.0
 author: Shawlei
 repo: https://github.com/Shawlei/astrbot_plugin_group_distiller
 

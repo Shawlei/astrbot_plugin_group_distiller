@@ -162,6 +162,38 @@
       }
     }
   },
+  "daily_digest": {
+    "type": "object",
+    "description": "每日定时总结",
+    "hint": "打开开关并选定时刻后，每天到点插件会把每个目标「当天聊过的全部内容」重新蒸一遍，给档案补一次当日汇总。到点时只要 bot 在运行就会补跑（比如设 23:00、23:40 才启动，也会立刻补一次）；同一天只跑一次。",
+    "default": {},
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用每日定时总结",
+        "hint": "打开后按下面的时刻自动跑；关掉就只剩盘中自动蒸馏与手动 /zl distill。",
+        "default": false
+      },
+      "time": {
+        "type": "string",
+        "description": "每天几点总结",
+        "hint": "24 小时制，填成 23:00 这样最稳妥。也认 23点 / 23点30 / 2300 / 23 这类写法。建议挑群里基本聊完的时刻，比如 23:00 或 23:30。",
+        "default": "23:00"
+      },
+      "min_messages": {
+        "type": "int",
+        "description": "当日最少语料条数",
+        "hint": "某个目标当天说话少于这个数就跳过它，避免用三言两语硬蒸出一份档案。填 0 表示不设限。",
+        "default": 5
+      },
+      "notify": {
+        "type": "bool",
+        "description": "完成后在群里播报",
+        "hint": "打开后总结完成会在目标所在的群里发一条简短结果。默认关闭，保持「静默蒸馏」的调性。",
+        "default": false
+      }
+    }
+  },
   "target_group_id": {
     "type": "string",
     "description": "（旧版遗留）目标群号",

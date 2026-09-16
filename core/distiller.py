@@ -55,6 +55,15 @@ class DistillResult:
     message: str
 
 
+@dataclass
+class DailyItem:
+    """每日总结里单个目标的结果。"""
+
+    spec: TargetSpec
+    ok: bool
+    detail: str
+
+
 def empty_snapshot() -> dict[str, Any]:
     """返回一份空的 Persona 快照。"""
     return {
@@ -468,7 +477,7 @@ class Distiller:
                 self._current = None
 
     async def _distill_once(self, umo: str, target: Optional[TargetSpec] = None) -> None:
-        """对单个目标执行一轮蒸馏。
+        """对单个目标执行一轮「未蒸馏语料」蒸馏。
 
         Args:
             umo: 会话来源。
@@ -479,20 +488,48 @@ class Distiller:
             logger.info("[%s] 无目标可蒸馏，跳过。", self.plugin_name)
             return
 
-        group_id = spec.group_id
-        qq = spec.qq_id
-        batch_limit = max(1, self._safe_int(self.config.get("distill_batch_messages", 300), 300))
-
-        records = await self.storage.fetch_undistilled(group_id, qq, batch_limit)
+        records = await self.storage.fetch_undistilled(
+            spec.group_id, spec.qq_id, self._batch_limit()
+        )
         if not records:
             logger.info("[%s] %s 无待蒸馏语料，跳过本轮。", self.plugin_name, spec.label())
             return
 
+        await self._distill_records(umo, spec, records)
+
+    def _batch_limit(self) -> int:
+        """单轮投喂语料条数上限。"""
+        return max(
+            1, self._safe_int(self.config.get("distill_batch_messages", 300), 300)
+        )
+
+    async def _distill_records(
+        self, umo: str, spec: TargetSpec, records: list[dict[str, Any]]
+    ) -> tuple[bool, str, Optional[dict[str, Any]]]:
+        """对**给定的这批语料**跑一轮 LLM 蒸馏并落库。
+
+        盘中自动蒸馏与每日定时总结共用这一条链路，保证两条路径的提示词、
+        合并规则、计数刷新、回调行为完全一致。
+
+        Args:
+            umo: 会话来源（用于选 Provider）。
+            spec: 目标。
+            records: 待蒸馏的语料行（来自 storage）。
+
+        Returns:
+            ``(是否成功, 说明, 合并后的快照)``。失败时快照为 None，且语料保持
+            未蒸馏状态，下一轮可以重来。
+        """
+        if not records:
+            return False, "没有语料", None
+
+        group_id = spec.group_id
+        qq = spec.qq_id
         existing = await self.storage.get_persona(group_id, qq)
         provider = await self._get_provider(umo)
         if provider is None:
             logger.error("[%s] 未获取到 LLM Provider，本轮蒸馏中止。", self.plugin_name)
-            return
+            return False, "未获取到 LLM Provider", None
 
         extra = str(self.config.get("custom_prompt_extra", "") or "")
         user_prompt = prompts.build_analyzer_user(
@@ -509,7 +546,7 @@ class Distiller:
             logger.error(
                 "[%s] LLM 返回无法解析为 JSON，本轮中止（语料保持未蒸馏）。", self.plugin_name
             )
-            return
+            return False, "LLM 返回无法解析", None
 
         corrections = await self.storage.get_corrections(group_id, qq)
         total = await self.storage.count_messages(group_id, qq)
@@ -532,14 +569,16 @@ class Distiller:
 
         await self.storage.save_persona(group_id, qq, merged)
         await self.storage.mark_distilled([int(r["id"]) for r in records])
-        # 用数据库的真实统计刷新计数缓存（round 后 undistilled 已归零一批）
+        # 用数据库的真实统计刷新计数缓存（本轮之后 undistilled 已归零一批）
         self.state.set_counts(spec.key, total, undistilled)
+
+        round_no = int(merged["meta"].get("distill_round", 0) or 0)
         logger.info(
             "[%s] %s 蒸馏完成：本轮 %d 条，轮次 %d，剩余未蒸馏 %d 条。",
             self.plugin_name,
             spec.label(),
             len(records),
-            merged["meta"].get("distill_round", 0),
+            round_no,
             undistilled,
         )
 
@@ -549,6 +588,128 @@ class Distiller:
                 await self._on_distilled(spec, merged)
             except Exception as exc:  # noqa: BLE001 - 回调失败不影响蒸馏结果
                 logger.error("[%s] 蒸馏回调执行失败: %s", self.plugin_name, exc)
+
+        return True, f"本轮 {len(records)} 条，第 {round_no} 轮", merged
+
+    # ------------------------------------------------------------------ #
+    # 每日定时总结
+    # ------------------------------------------------------------------ #
+
+    async def digest_day(
+        self,
+        umo: str,
+        spec: TargetSpec,
+        start_ts: int,
+        end_ts: int,
+        *,
+        min_messages: int = 0,
+    ) -> tuple[bool, str]:
+        """把某个目标在 ``[start_ts, end_ts]`` 区间内的**全部语料**蒸一遍。
+
+        与 :meth:`_distill_once` 的区别：不限定"未蒸馏"，当天聊过的内容全部
+        重新过一遍 —— 这正是"总结今天"的语义。
+
+        Args:
+            umo: 会话来源。
+            spec: 目标。
+            start_ts: 区间起点（一般是当天 00:00）。
+            end_ts: 区间终点（一般是当前时刻）。
+            min_messages: 当天语料少于这个数就跳过（0 表示不设限）。
+
+        Returns:
+            ``(是否处理完毕, 说明)``。返回 True 表示不必重试 —— 包括
+            "当天没语料""低于阈值"这类正常的跳过。返回 False 表示遇到
+            可重试的故障（如 LLM 不可用）。
+        """
+        target = spec or self.state.active_target()
+        if target is None:
+            return True, "没有配置目标"
+
+        day_count = await self.storage.count_range(
+            target.group_id, target.qq_id, start_ts, end_ts
+        )
+        if day_count <= 0:
+            return True, "当天没有语料"
+        if min_messages > 0 and day_count < min_messages:
+            return True, f"当天仅 {day_count} 条（低于阈值 {min_messages}）"
+
+        records = await self.storage.fetch_range(
+            target.group_id, target.qq_id, start_ts, end_ts, self._batch_limit()
+        )
+        if not records:
+            return True, "当天没有语料"
+
+        ok, detail, _ = await self._distill_records(umo, target, records)
+        return ok, detail
+
+    async def run_daily_digest_detailed(
+        self,
+        umo_for: Any,
+        start_ts: int,
+        end_ts: int,
+        *,
+        min_messages: int = 0,
+    ) -> list[DailyItem]:
+        """对全部目标跑一次每日总结，返回**逐目标**的结果。
+
+        逐目标返回是为了播报时能各发各的群：把 A 群的结果发到 B 群，等于
+        平白泄露了"B 群某人是蒸馏目标"这件事。
+
+        Args:
+            umo_for: 字符串，或 ``(spec) -> str`` 的可调用对象。
+            start_ts: 区间起点。
+            end_ts: 区间终点。
+            min_messages: 当天语料少于这个数就跳过该目标。
+
+        Returns:
+            每个目标一条 :class:`DailyItem`；没有目标时返回空列表。
+        """
+        specs = self.state.collect_targets()
+        items: list[DailyItem] = []
+        for spec in specs:
+            try:
+                umo = umo_for(spec) if callable(umo_for) else str(umo_for)
+            except Exception:  # noqa: BLE001 - 取会话来源失败也要继续其它目标
+                umo = str(umo_for)
+            try:
+                ok, detail = await self.digest_day(
+                    umo, spec, start_ts, end_ts, min_messages=min_messages
+                )
+            except Exception as exc:  # noqa: BLE001 - 单个目标失败不影响其它目标
+                logger.error(
+                    "[%s] %s 每日总结失败: %s",
+                    self.plugin_name,
+                    spec.label(),
+                    exc,
+                    exc_info=True,
+                )
+                ok, detail = False, f"异常：{exc}"
+            items.append(DailyItem(spec=spec, ok=ok, detail=detail))
+        return items
+
+    async def run_daily_digest(
+        self,
+        umo_for: Any,
+        start_ts: int,
+        end_ts: int,
+        *,
+        min_messages: int = 0,
+    ) -> tuple[bool, str]:
+        """对全部目标跑一次每日总结，返回 ``(是否全部处理完毕, 汇总说明)``。
+
+        需要逐目标结果（例如要分群播报）时请用
+        :meth:`run_daily_digest_detailed`。
+        """
+        items = await self.run_daily_digest_detailed(
+            umo_for, start_ts, end_ts, min_messages=min_messages
+        )
+        if not items:
+            return True, "没有配置任何目标"
+        detail = "；".join(
+            f"{item.spec.display_name}({item.spec.qq_id})：{item.detail}"
+            for item in items
+        )
+        return all(item.ok for item in items), detail
 
     # ------------------------------------------------------------------ #
     # LLM 交互

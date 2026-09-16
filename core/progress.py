@@ -175,6 +175,10 @@ class PanelData:
     formed_layers: int = 0
     total_layers: int = len(prompts.LAYER_KEYS)
     targets: list[TargetRow] = field(default_factory=list)
+    # 每日定时总结
+    daily_enabled: bool = False
+    daily_time: str = ""
+    daily_last: str = ""
 
 
 def render_no_target() -> str:
@@ -224,6 +228,12 @@ def render_panel(data: PanelData) -> str:
         f"📅 跨度    {fmt_span(data.min_ts, data.max_ts)}",
         f"🧩 档案    完整度 {data.completeness}% · 已成型 {data.formed_layers}/{data.total_layers} 层",
     ]
+
+    if data.daily_enabled:
+        daily = f"⏰ 每日总结  {data.daily_time}"
+        if data.daily_last:
+            daily += f" · {data.daily_last}"
+        lines.append(daily)
 
     # 多目标时才追加清单，避免单目标用户被多余信息干扰
     if len(data.targets) > 1:
@@ -347,6 +357,7 @@ def render_help(prefix: str = "/zl") -> str:
         f"{p}                查看当前目标进度面板",
         f"{p} on / off       开启 / 关闭采集",
         f"{p} distill [all]  手动蒸馏（加 all 则依次蒸馏全部目标）",
+        f"{p} digest [all]   立即跑一次「每日总结」（用当天的全部对话蒸馏）",
         "— 档案与人格 —",
         f"{p} profile        查看当前目标的 5 层人格档案",
         f"{p} persona        生成可粘贴进 AstrBot 的人格模板",
