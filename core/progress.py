@@ -290,10 +290,12 @@ def render_profile(
     header = f"🧬 {nickname or '未知昵称'} 的人格档案（{qq}）"
     if group_id:
         header += f" @ 群 {group_id}"
+    samples = prompts.snap_samples(snapshot)
     lines = [
         header,
         f"第 {meta.get('distill_round', 0)} 轮 · 完整度 {compute_completeness(snapshot)}% "
-        f"· 语料 {fmt_int(meta.get('total_messages', 0))} 条",
+        f"· 语料 {fmt_int(meta.get('total_messages', 0))} 条 "
+        f"· 应答样例 {len(samples)} 条",
         SEP,
     ]
 
@@ -308,9 +310,30 @@ def render_profile(
                     text = str(item.get("text") or "").strip()
                     flag = " ⚠️冲突" if item.get("conflict") else ""
                     lines.append(f"- {text}{flag}")
+                    trigger = str(item.get("trigger") or "").strip()
+                    if trigger:
+                        lines.append(f"    · 出现时机：{trigger}")
                 else:
                     lines.append(f"- {item}")
         lines.append("")
+
+    lines.append("【场景应答样例】")
+    if samples:
+        for item in samples[:5]:
+            if isinstance(item, dict):
+                situation = str(item.get("situation") or "").strip()
+                reply = str(item.get("reply") or "").strip()
+                if situation and reply:
+                    lines.append(f"- 【{situation}】{reply}")
+                elif reply:
+                    lines.append(f"- {reply}")
+            else:
+                lines.append(f"- {item}")
+        if len(samples) > 5:
+            lines.append(f"……（共 {len(samples)} 条，完整内容见 /zl export）")
+    else:
+        lines.append("- （暂无）")
+    lines.append("")
 
     lines.append("【⚠️ 人工纠正层（优先级最高）】")
     if corrections:

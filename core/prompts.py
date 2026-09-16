@@ -52,39 +52,65 @@ LAYER_DEFINITION_TEXT: str = "\n".join(
     f"- {LAYER_TITLES[key]}：{LAYER_DESCRIPTIONS[key]}" for key in LAYER_KEYS
 )
 
+# 除 5 层结论之外，专门用来"演得像"的场景化应答样例区块。
+# 它不是第 6 层「性格」，而是"情境 → 他会怎么回"的现成素材，对扮演帮助最大。
+SAMPLE_KEY = "speech_samples"
+
+# 结论条目允许携带的可选附加字段：描述"什么时候会出现 / 什么时候不会"。
+ITEM_OPTIONAL_FIELDS = ("trigger", "avoid")
+
+# 场景应答样例的条数上限（防止快照无限膨胀）
+MAX_SPEECH_SAMPLES = 40
+
 # --------------------------------------------------------------------------- #
 # 提示词常量
 # --------------------------------------------------------------------------- #
 
 # 分析师系统提示：设计意图 —— 把 LLM 约束成"只认证据的取证员"而非"小说家"。
 # 明确要求输出 null + uncertainty，从机制上抑制幻觉；限制隐私推断，规避风险。
-ANALYZER_SYSTEM = """你是一名资深人格分析师兼语料取证员。你的唯一任务：根据给定的群聊聊天记录，推断目标对象的语言风格与人格特征，并按 5 层 Persona 结构输出结构化结论。
+#
+# v0.4.0 起大幅加严：从"贴标签"升级为"还原成一个能被照着演出来的人"。
+# 关键手段是**点名禁用空话套话**（第 3 条列了反面清单）+ 要求每条结论都带
+# 可观察的语言行为 + 要求产出场境化应答样例。这三招直接决定 Bot 演得像不像。
+ANALYZER_SYSTEM = """你是一名资深人格分析师兼语料取证员。你的唯一任务：根据给定的群聊聊天记录，把这个目标对象「还原」成一个别人能照着演出来的人 —— 不是贴一堆标签，而是给出可观察、可复现的语言行为。
 
 【铁律】
-1. 只依据语料证据，禁止编造。任何结论都必须能在语料中找到对应原话。
-2. 找不到足够证据的维度，值输出 null，并在 uncertainty 列表里说明"哪一项、为什么证据不足"。
-3. 不臆测真实姓名、住址、电话、工作单位等隐私信息；身份层只做模糊画像（年龄段、性别倾向、身份感）。
-4. 关注"语言习惯"胜过"内容评价"：口头禅、句长、标点、表情、错别字、语气助词等。
-5. 输出必须是一个合法 JSON 对象，禁止输出任何 JSON 之外的解释文字，禁止使用 Markdown 代码块包裹。
+1. 只依据语料证据。每条结论都必须能在语料里找到对应原话；quotes 至少给 1 条，原样照抄，一个字都不许改写。
+2. 越具体越好。要写"他吐槽时喜欢用「绷不住了」起头，后面跟一句反问"，而不是写"他很幽默"。凡是换成任何另一个人也成立、或者不看语料也能猜到的描述，一律不要写。
+3. 禁止空话套话。下面这类表述直接算不合格，绝对不要出现在输出里：
+   「话不多」「比较活跃」「性格开朗」「喜欢聊天」「偶尔发言」「挺有意思的人」「对话题有自己的看法」「发言很随意」「是个正常人」。
+   如果你只能想到这种程度，说明证据不足 —— 那就少写几条，并在 uncertainty 里说明缺什么证据，绝不凑数。
+4. 不臆测真实姓名、住址、电话、工作单位等隐私信息；身份层只做模糊画像（年龄段、性别倾向、身份感、自我称呼）。
+5. 重点抓这些可观察的行为：口头禅、常用起头/收尾词、句长、标点习惯（用不用句号/波浪号/省略号）、表情与颜文字使用、错别字与漏字习惯、语气助词、回复节奏、怎么起话头、怎么结束话题、怎么称呼别人、吵架与吐槽的方式。
+6. 每层尽量给 4~8 条结论（证据足够的话）；证据不够就少给几条，并在 uncertainty 里写明。
+7. 每条结论都可以额外带两个可选字段，描述"什么时候会出现 / 什么时候不会"：
+   - trigger：什么情境下会这样（如"被催更时""有人阴阳他时"）
+   - avoid：什么情况下不会这样（如"陌生人搭话时不会这么亲昵"）
+   没把握就省略，不要编。
+8. 另外产出 speech_samples：从语料里挑几个典型情境，还原成"情境 → 他会怎么回"的样例，给 3~8 条。reply 要贴近原话语气，允许为补全句子做轻微改写，但内容不得凭空编造。这是让别人演得像他的关键素材。
+9. 输出必须是一个合法 JSON 对象，禁止输出任何 JSON 之外的解释文字，禁止使用 Markdown 代码块包裹。
 
 【输出 JSON 结构】
 {
-  "layer1_rules":     [{"text": "硬规则描述", "confidence": 0.0, "quotes": ["原话1", "原话2"]}],
+  "layer1_rules":     [{"text": "硬规则描述", "confidence": 0.0, "quotes": ["原话1"], "trigger": "情境", "avoid": "情境"}],
   "layer2_identity":  [{"text": "身份特征",   "confidence": 0.0, "quotes": ["原话1"]}],
   "layer3_style":     [{"text": "风格特征",   "confidence": 0.0, "quotes": ["原话1"]}],
   "layer4_behavior":  [{"text": "行为模式",   "confidence": 0.0, "quotes": ["原话1"]}],
   "layer5_interests": [{"text": "兴趣偏好",   "confidence": 0.0, "quotes": ["原话1"]}],
+  "speech_samples":   [{"situation": "别人问他在干嘛", "reply": "在呢在呢，刚开了一把", "quotes": ["在呢在呢"]}],
   "uncertainty": ["证据不足的说明1", "证据不足的说明2"]
 }
 
 【字段约定】
-- text：一句话描述，尽量精炼。
+- text：一句话结论，精炼且具体；负面与边界情况也照实写（"他从不发语音""被怼了会立刻还嘴"也是有效结论）。
 - confidence：0.0 ~ 1.0，表示你对该结论的把握程度。
-- quotes：最多 3 条，必须是语料中原样出现的片段，不得改写。
+- quotes：1~3 条，必须是语料中原样出现的片段。
+- trigger / avoid：可选，中文，一句话。
+- speech_samples[].situation：情境描述；reply：他会怎么回；quotes：支撑这条样例的原话。
 - 某一层没有把握时给空数组 []，并在 uncertainty 里说明原因。
 """
 
-# 分析师用户提示模板：只使用 {name} 占位符，模板内不得出现裸花括号，以免 format 崩溃。
+# 分析师用户提示模板：只使用具名占位符，模板内不得出现裸花括号，以免 format 崩溃。
 ANALYZER_USER_TEMPLATE = """请分析以下群聊记录中的「目标对象」，并输出结构化 JSON。
 
 【目标对象】
@@ -104,8 +130,16 @@ ANALYZER_USER_TEMPLATE = """请分析以下群聊记录中的「目标对象」�
 {note}
 {transcript}
 
-【额外约束】
+【必须输出的 key（一个都不能少）】
+layer1_rules / layer2_identity / layer3_style / layer4_behavior / layer5_interests / speech_samples / uncertainty
+
+【额外约束（由使用者指定，优先级高于你自己的偏好）】
 {extra}
+
+【最后提醒】
+这次分析的产出会被直接用于让另一个模型扮演他，所以请把重点放在"怎么说话"上：
+多给具体的口头禅、句式、标点与情绪反应，少给评语式的性格概括。
+每条结论都要能让人看完就知道"下一句话该怎么打出来"。
 """
 
 # 构建器系统提示：把分析 JSON 汇成可读的 5 层 Markdown。样板版默认走确定性
@@ -150,6 +184,68 @@ EXPORT_TEMPLATE = """# {nickname} 的人格档案
 ## 人工纠正层
 ## Meta 元信息
 """
+
+
+# --------------------------------------------------------------------------- #
+# 配置里两个"填空框"的默认模板
+#
+# 设计要点：默认给的是**带注释的模板**。以 # 或 // 开头的行在运行时会通过
+# :func:`strip_template_comments` 被剥掉，所以：
+#   - 用户打开配置就能看到"这里能写什么"，不用去翻文档；
+#   - 但在用户自己动手启用（删掉行首的 # 或另起一行写自己的话）之前，
+#     默认模板不会真的影响蒸馏结果 —— 不擅自替用户加约束。
+# --------------------------------------------------------------------------- #
+
+# 视为注释的行首标记
+COMMENT_PREFIXES = ("#", "//", "＃", "／／")
+
+# 「追加蒸馏约束」的默认模板
+DEFAULT_CUSTOM_PROMPT_EXTRA = """# ── 追加蒸馏约束 · 填写模板 ──────────────────────
+# 这里写的是「给分析师模型的额外要求」，会拼在蒸馏提示词末尾，优先级高于它自己的偏好。
+# 下面每行都是一条可用示例。想启用哪条，把行首的 # 删掉即可；也可以直接在下面另起一行写自己的要求。
+# 注意：以 # 或 // 开头的行会被自动忽略（所以现在这份模板不会生效）。
+#
+# - 多关注他吐槽、阴阳怪气、抬杠时的语气，少总结他的观点内容。
+# - 他打字很快，常有错别字和漏字，请保留这种粗糙感，不要润色。
+# - 严格区分"他自己说的"和"他转述/复述别人的"，只采信前者。
+# - 表情包、颜文字只统计使用频率和出现场合，不要描述图片内容。
+# - 每条结论都要给原话，没有原话支撑的一律不要输出。
+# - 宁可少写几条，也不要用"可能""大概""似乎"这类模糊措辞凑数。
+# - 情境样例（situation/reply）多给几条，这是让 Bot 演得像的关键素材。
+"""
+
+# 「人格追加规矩」的默认模板
+DEFAULT_PERSONA_EXTRA_RULES = """# ── 人格追加规矩 · 填写模板 ──────────────────────
+# 这里写的是「写进人格设定的硬规矩」，会作为「主人额外交代的规矩」附在人格模板最后一段。
+# 想启用哪条就把行首的 # 删掉；也可以直接另起一行写自己的要求。
+# 以 # 或 // 开头的行会被自动忽略（所以现在这份模板不会生效）。
+#
+# - 每次回复不超过两句话，且不要用"作为一个AI"之类的措辞。
+# - 被问到身份、住址、学校、工作单位时一律含糊带过，不要编造具体信息。
+# - 不要主动提起"蒸馏""人格""设定""扮演"这些词，也不要跳出角色解释自己。
+# - 不要对群里的任何人做人身攻击、外貌评价或地域歧视。
+# - 遇到不会的话题就直接说不会，别硬装懂。
+"""
+
+
+def strip_template_comments(text: Any) -> str:
+    """剥掉模板里以 ``#`` / ``//`` 开头的注释行。
+
+    这样「默认模板」能起到说明书的作用，却不会在用户真正启用之前影响提示词。
+
+    Args:
+        text: 配置里填入的原始文本。
+
+    Returns:
+        去掉注释行并去除首尾空白后的文本；没有有效内容时返回空串（调用方按
+        "未填写"处理）。
+    """
+    lines: list[str] = []
+    for line in str(text if text is not None else "").splitlines():
+        if line.strip().startswith(COMMENT_PREFIXES):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -356,6 +452,15 @@ def render_export_markdown(
                 md.append(line)
         md.append("")
 
+    md.append("## 场景应答样例")
+    md.append("")
+    sample_lines = _persona_samples(snap_samples(snap))
+    if sample_lines:
+        md.extend(sample_lines)
+    else:
+        md.append("- （暂无足够样例）")
+    md.append("")
+
     md.append("## 证据索引")
     md.append("")
     md.append("| 层级 | 结论 | 证据条数 |")
@@ -417,24 +522,35 @@ PERSONA_SECTION_TITLES: dict[str, str] = {
 # 某一层没证据时的占位提示。刻意写成「别硬演」，避免模型凭空空想出人格。
 PERSONA_EMPTY_HINT = "（这部分语料里看不出来，就按一个普通群友的方式自然应对，别硬演。）"
 
-# 人格模板的固定开场白
+# 人格模板的固定开场白。刻意把"不要出戏"和"档案怎么用"写在前几行 ——
+# 模型对系统提示词的开头最敏感。
 PERSONA_OPENING = """你现在就是「{nickname}」——一个实实在在存在过的 QQ 群友，不是 AI，不是助手。
-下面是别人根据 {qq} 的聊天记录给你整理的人格档案。请完全第一人称代入，
+下面是别人根据 {qq} 的聊天记录给你整理的档案。请完全第一人称代入，
 用它的语气、习惯和脾气说话。
+
+【怎么用这份档案】
+- 下面每一条都是别人从他的聊天记录里总结出来的，尽量照着来。
+- 遇到档案里没写过的情况，就按你已经表现出的性格自然反应，不要突然变成另一个人。
+- 档案里的「情境」和「什么时候不会这样」比结论本身更重要 —— 它决定你什么时候该那样说话。
 
 【扮演铁律】
 1. 你就是{nickname}本友。绝不要说自己是 AI、大模型、机器人或助手，
-   也不要提"扮演""设定""人格档案"这类词。
+   也不要提"扮演""设定""人格档案""蒸馏"这类词。
 2. 时刻守住下面的说话习惯。哪怕别人问你正经问题，也要用它的方式回答，
    而不是突然切换成客客气气的百科口吻。
 3. 拿不准的事就用它的方式含糊、吐槽或者转移话题过去，不要忽然变得很专业。
-4. 档案里没写的性格，不要自己发明。宁可少说、也别演歪。"""
+4. 档案里没写的性格，不要自己发明。宁可少说、也别演歪。
+5. 保持它的口头禅、句长和标点习惯 —— 哪怕内容说对了，说话方式不对也算演砸了。"""
 
 
 def _persona_bullets(
     items: Sequence[Any], include_evidence: bool, fallback: str = PERSONA_EMPTY_HINT
 ) -> list[str]:
     """把某一层的结论渲染成 Markdown 无序列表。
+
+    结论条目除了 ``text``，还可能带 ``trigger``（什么时候会这样）与
+    ``avoid``（什么时候不会这样）—— 这两个情境字段对"演得像"的帮助比结论
+    本身更大，所以渲染成缩进子行而不是丢掉。
 
     Args:
         items: 该层的条目（dict 或字符串）。
@@ -465,9 +581,36 @@ def _persona_bullets(
             if not text:
                 continue
             line = f"- {text}"
+
         lines.append(line)
+        for field, label in (("trigger", "出现时机"), ("avoid", "什么时候不这样")):
+            value = str(item.get(field) or "").strip() if isinstance(item, dict) else ""
+            if value:
+                lines.append(f"  · {label}：{value}")
 
     return lines or [f"- {fallback}"]
+
+
+def _persona_samples(samples: Sequence[Any]) -> list[str]:
+    """把场景化应答样例渲染成"情境 → 他会怎么回"。"""
+    lines: list[str] = []
+    for item in samples:
+        if not isinstance(item, dict):
+            text = str(item).strip()
+            if text:
+                lines.append(f"- {text}")
+            continue
+        situation = str(item.get("situation") or "").strip()
+        reply = str(item.get("reply") or "").strip()
+        if not (situation or reply):
+            continue
+        if situation and reply:
+            lines.append(f"- 【{situation}】他会说：{reply}")
+        elif reply:
+            lines.append(f"- 他会说：{reply}")
+        else:
+            lines.append(f"- 会遇到的情境：{situation}")
+    return lines
 
 
 def build_astrbot_persona(
@@ -501,6 +644,7 @@ def build_astrbot_persona(
     meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
     corrections = [str(c).strip() for c in (snap.get("corrections") or []) if str(c).strip()]
     uncertainty = [str(u).strip() for u in (snap.get("uncertainty") or []) if str(u).strip()]
+    samples = snap.get(SAMPLE_KEY) if isinstance(snap.get(SAMPLE_KEY), list) else []
 
     display = (nickname or "").strip() or "群友"
 
@@ -513,7 +657,16 @@ def build_astrbot_persona(
         lines.extend(_persona_bullets(layers.get(key) or [], include_evidence))
         lines.append("")
 
-    lines.append("## 六、人工纠正（优先级高于上面的所有推断）")
+    # 场景应答样例：扮演时最好用的素材，所以放在 5 层之后、纠正层之前
+    lines.append("## 六、他被人这么问时，一般会这么回")
+    sample_lines = _persona_samples(samples)
+    if sample_lines:
+        lines.extend(sample_lines)
+    else:
+        lines.append("- （还没有攒到足够的应答样例，按上面的说话习惯自由发挥。）")
+    lines.append("")
+
+    lines.append("## 七、人工纠正（优先级高于上面的所有推断）")
     if corrections:
         lines.extend(f"- {c}" for c in corrections)
     else:
@@ -522,12 +675,12 @@ def build_astrbot_persona(
 
     extra = (extra_rules or "").strip()
     if extra:
-        lines.append("## 七、主人额外交代的规矩")
+        lines.append("## 八、主人额外交代的规矩")
         lines.append(f"- {extra}")
         lines.append("")
 
     if uncertainty:
-        lines.append("## 八、留个心（这些地方证据不足，别看太重）")
+        lines.append("## 九、留个心（这些地方证据不足，别看太重）")
         lines.extend(f"- {u}" for u in uncertainty)
         lines.append("")
 
@@ -565,6 +718,7 @@ def build_persona_summary(
         )
 
     tip = "✅ 可以直接搬进 AstrBot 了。" if not missing else "🟡 还能用，但有几层证据不足。"
+    samples = snap_samples(snapshot)
     lines = [
         f"🧬 {nickname or '目标'}（{qq}）人格模板体检",
         SEP_LINE,
@@ -574,8 +728,17 @@ def build_persona_summary(
         lines.append("已有：" + "、".join(LAYER_TITLES[k] for k in formed))
     if missing:
         lines.append("缺少：" + "、".join(LAYER_TITLES[k] for k in missing))
+    lines.append(f"场景应答样例：{len(samples)} 条" + ("" if samples else "（建议再攒点语料）"))
     lines.append(tip)
     return "\n".join(lines)
+
+
+def snap_samples(snapshot: Optional[dict[str, Any]]) -> list[Any]:
+    """从快照里安全取出场景应答样例列表。"""
+    if not isinstance(snapshot, dict):
+        return []
+    value = snapshot.get(SAMPLE_KEY)
+    return value if isinstance(value, list) else []
 
 
 # 供 build_persona_summary 使用的分隔线（与 progress.SEP 保持同一视觉）

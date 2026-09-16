@@ -605,6 +605,11 @@ class GroupDistillerPlugin(Star):
         if daily["notify"]:
             await self._broadcast_digest(items)
 
+        # 总结完就把人格覆盖写入 AstrBot，让人格跟着语料每天更新
+        synced = await self._sync_persona_after_digest(items)
+        if synced:
+            logger.info("[%s] 每日总结后同步了 %d 个人格。", PLUGIN_NAME, synced)
+
         return all(item.ok for item in items) if items else True
 
     async def _broadcast_digest(self, items: list[Any]) -> None:
@@ -846,6 +851,7 @@ class GroupDistillerPlugin(Star):
             "auto_write_threshold": self._safe_int(
                 raw.get("auto_write_threshold", 80), 80
             ),
+            "sync_after_digest": bool(raw.get("sync_after_digest", True)),
             "include_evidence": bool(raw.get("include_evidence", False)),
             "extra_rules": str(raw.get("extra_rules", "") or ""),
         }
@@ -866,9 +872,49 @@ class GroupDistillerPlugin(Star):
             spec.display_name,
             spec.qq_id,
             include_evidence=cfg["include_evidence"],
-            extra_rules=cfg["extra_rules"],
+            # 追加规矩默认给的是带 # 的模板，用户启用后才真正生效
+            extra_rules=prompts.strip_template_comments(cfg["extra_rules"]),
             plugin_name=PLUGIN_DISPLAY,
         )
+
+    async def _sync_persona_after_digest(self, items: list[Any]) -> int:
+        """每日总结结束后，把每个目标的人格**覆盖写入** AstrBot 人格设定。
+
+        与 ``auto_write`` 的区别：这条路**不看完整度阈值** —— 只要开了
+        ``sync_after_digest``，每天总结完就同步一次，让人格跟着语料持续更新。
+
+        Returns:
+            成功同步的目标数。
+        """
+        cfg = self._persona_cfg()
+        if not (cfg["enabled"] and cfg["sync_after_digest"]):
+            return 0
+
+        synced = 0
+        for item in items:
+            snapshot = getattr(item, "snapshot", None)
+            if not snapshot:
+                continue
+            spec = item.spec
+            persona_id = self._persona_id(spec)
+            text = self._build_persona_text(spec, snapshot)
+            ok, message = await persona_bridge.push_persona(self.context, persona_id, text)
+            if ok:
+                synced += 1
+                logger.info(
+                    "[%s] 每日总结后已同步人格：%s → %s",
+                    PLUGIN_NAME,
+                    spec.label(),
+                    message,
+                )
+            else:
+                logger.warning(
+                    "[%s] 每日总结后同步人格失败（%s）：%s",
+                    PLUGIN_NAME,
+                    spec.label(),
+                    message,
+                )
+        return synced
 
     async def _on_distilled(
         self, spec: TargetSpec, snapshot: dict[str, Any]

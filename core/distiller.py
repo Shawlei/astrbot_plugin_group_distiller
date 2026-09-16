@@ -57,17 +57,27 @@ class DistillResult:
 
 @dataclass
 class DailyItem:
-    """每日总结里单个目标的结果。"""
+    """每日总结里单个目标的结果。
+
+    Attributes:
+        spec: 目标。
+        ok: 是否处理完毕（False 表示遇到可重试的故障）。
+        detail: 人话说明。
+        snapshot: 该目标总结后的人格快照；没有档案时为 None。播报与"总结后同步
+            人格"都要用它。
+    """
 
     spec: TargetSpec
     ok: bool
     detail: str
+    snapshot: Optional[dict[str, Any]] = None
 
 
 def empty_snapshot() -> dict[str, Any]:
     """返回一份空的 Persona 快照。"""
     return {
         "layers": {key: [] for key in prompts.LAYER_KEYS},
+        "speech_samples": [],
         "uncertainty": [],
         "corrections": [],
         "meta": {
@@ -152,6 +162,61 @@ def _coerce_item(raw: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _with_optional_fields(item: dict[str, Any], raw: Any) -> dict[str, Any]:
+    """把条目里可选的情境字段（``trigger`` / ``avoid``）带进规整后的结构。
+
+    这两个字段描述"什么时候会这样 / 什么时候不会"，对"演得像"的帮助比结论
+    本身更大，所以在合并过程中必须保留而不是丢掉。
+    """
+    if not isinstance(raw, dict):
+        return item
+    for field in prompts.ITEM_OPTIONAL_FIELDS:
+        value = str(raw.get(field) or "").strip()
+        if value:
+            item[field] = value[:120]
+    return item
+
+
+def _coerce_sample(raw: Any) -> Optional[dict[str, Any]]:
+    """把 LLM 返回的场景应答样例规整成统一结构，非法返回 None。"""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        return {"situation": "", "reply": text, "quotes": [], "evidence": 1}
+    if not isinstance(raw, dict):
+        return None
+
+    situation = str(raw.get("situation") or raw.get("scene") or "").strip()
+    reply = str(raw.get("reply") or raw.get("answer") or "").strip()
+    if not situation and not reply:
+        return None
+
+    quotes: list[str] = []
+    for q in _as_list(raw.get("quotes")):
+        qs = str(q).strip()
+        if qs and qs not in quotes:
+            quotes.append(qs)
+        if len(quotes) >= 3:
+            break
+
+    return {
+        "situation": situation[:120],
+        "reply": reply[:300],
+        "quotes": quotes,
+        "evidence": 1,
+    }
+
+
+def sample_key_of(sample: Any) -> str:
+    """场景应答样例的去重键：情境 + 回复一起归一化。"""
+    if not isinstance(sample, dict):
+        return normalize_text(sample)
+    return normalize_text(
+        f"{sample.get('situation') or ''}|{sample.get('reply') or ''}"
+    )
+
+
 def _copy_layers(existing: Optional[dict[str, Any]]) -> dict[str, Any]:
     """安全复制已有快照（规整条目、保留 evidence 与 meta）。"""
     snap = empty_snapshot()
@@ -171,8 +236,23 @@ def _copy_layers(existing: Optional[dict[str, Any]]) -> dict[str, Any]:
                 except (TypeError, ValueError):
                     coerced["evidence"] = 1
                 coerced["conflict"] = bool(it.get("conflict", coerced["conflict"]))
+                _with_optional_fields(coerced, it)
             cleaned.append(coerced)
         snap["layers"][key] = cleaned
+
+    # 场景应答样例：保留原有证据强度
+    samples: list[dict[str, Any]] = []
+    for raw in _as_list(existing.get(prompts.SAMPLE_KEY)):
+        sample = _coerce_sample(raw)
+        if sample is None:
+            continue
+        if isinstance(raw, dict):
+            try:
+                sample["evidence"] = int(raw.get("evidence", 1) or 1)
+            except (TypeError, ValueError):
+                sample["evidence"] = 1
+        samples.append(sample)
+    snap[prompts.SAMPLE_KEY] = samples
 
     snap["uncertainty"] = [str(u) for u in _as_list(existing.get("uncertainty"))]
     snap["corrections"] = [str(c) for c in _as_list(existing.get("corrections"))]
@@ -221,6 +301,7 @@ def merge_snapshot(
             item = _coerce_item(raw)
             if item is None:
                 continue
+            _with_optional_fields(item, raw)
             norm = normalize_text(item["text"])
             if not norm:
                 continue
@@ -239,9 +320,45 @@ def merge_snapshot(
                         quotes.append(q)
                 if item.get("conflict"):
                     target["conflict"] = True
+                # 已有的条目缺情境字段时，用新证据补上（情境信息越全越像）
+                for field in prompts.ITEM_OPTIONAL_FIELDS:
+                    if not target.get(field) and item.get(field):
+                        target[field] = item[field]
             else:
                 layers.setdefault(key, []).append(item)
                 index[norm] = item
+
+    # 场景应答样例：按「情境 + 回复」去重，重复出现只累加证据
+    samples: list[dict[str, Any]] = _as_list(snap.get(prompts.SAMPLE_KEY))
+    sample_index = {
+        sample_key_of(item): item for item in samples if isinstance(item, dict)
+    }
+    for raw in _as_list(analysis.get(prompts.SAMPLE_KEY) if isinstance(analysis, dict) else None):
+        sample = _coerce_sample(raw)
+        if sample is None:
+            continue
+        norm = sample_key_of(sample)
+        if not norm:
+            continue
+        if norm in sample_index:
+            target = sample_index[norm]
+            try:
+                target["evidence"] = int(target.get("evidence", 1)) + 1
+            except (TypeError, ValueError):
+                target["evidence"] = 2
+        else:
+            samples.append(sample)
+            sample_index[norm] = sample
+    # 超出上限时保留证据最强的那些（保持原有相对顺序）
+    if len(samples) > prompts.MAX_SPEECH_SAMPLES:
+        keep = sorted(
+            range(len(samples)),
+            key=lambda i: int(samples[i].get("evidence", 1) or 1),
+            reverse=True,
+        )[: prompts.MAX_SPEECH_SAMPLES]
+        keep_set = set(keep)
+        samples = [s for i, s in enumerate(samples) if i in keep_set]
+    snap[prompts.SAMPLE_KEY] = samples
 
     # 累积不确定项（analysis 里若误传字符串，也只会当成一条，不拆字符）
     uncertainty = _as_list(snap.get("uncertainty"))
@@ -503,8 +620,23 @@ class Distiller:
             1, self._safe_int(self.config.get("distill_batch_messages", 300), 300)
         )
 
+    def _max_chars(self) -> int:
+        """单轮投喂语料的字符预算（超出会按信息量抽样）。
+
+        语料给得越多，分析出的人格越细；代价是 token。默认 12000 是"信息量"
+        与"成本"之间比较舒服的位置，想更细可以往上调。
+        """
+        return max(
+            2000, self._safe_int(self.config.get("distill_max_chars", 12000), 12000)
+        )
+
     async def _distill_records(
-        self, umo: str, spec: TargetSpec, records: list[dict[str, Any]]
+        self,
+        umo: str,
+        spec: TargetSpec,
+        records: list[dict[str, Any]],
+        *,
+        notify: bool = True,
     ) -> tuple[bool, str, Optional[dict[str, Any]]]:
         """对**给定的这批语料**跑一轮 LLM 蒸馏并落库。
 
@@ -515,6 +647,8 @@ class Distiller:
             umo: 会话来源（用于选 Provider）。
             spec: 目标。
             records: 待蒸馏的语料行（来自 storage）。
+            notify: 是否触发 ``on_distilled`` 回调。每日总结会传 False ——
+                因为总结结束后由它自己统一同步人格，避免同一次总结写两遍。
 
         Returns:
             ``(是否成功, 说明, 合并后的快照)``。失败时快照为 None，且语料保持
@@ -531,13 +665,17 @@ class Distiller:
             logger.error("[%s] 未获取到 LLM Provider，本轮蒸馏中止。", self.plugin_name)
             return False, "未获取到 LLM Provider", None
 
-        extra = str(self.config.get("custom_prompt_extra", "") or "")
+        # 追加约束走"模板注释剥离"：配置默认给的是带 # 的模板，用户启用后才生效
+        extra = prompts.strip_template_comments(
+            self.config.get("custom_prompt_extra", "")
+        )
         user_prompt = prompts.build_analyzer_user(
             nickname=spec.nickname,
             qq=qq,
             records=records,
             existing_snapshot=existing,
             extra=extra,
+            max_chars=self._max_chars(),
         )
 
         text = await self._chat(provider, prompts.ANALYZER_SYSTEM, user_prompt)
@@ -583,7 +721,7 @@ class Distiller:
         )
 
         # 通知外部（例如「达到完整度阈值就写入 AstrBot 人格」）
-        if self._on_distilled is not None:
+        if notify and self._on_distilled is not None:
             try:
                 await self._on_distilled(spec, merged)
             except Exception as exc:  # noqa: BLE001 - 回调失败不影响蒸馏结果
@@ -639,7 +777,7 @@ class Distiller:
         if not records:
             return True, "当天没有语料"
 
-        ok, detail, _ = await self._distill_records(umo, target, records)
+        ok, detail, _ = await self._distill_records(umo, target, records, notify=False)
         return ok, detail
 
     async def run_daily_digest_detailed(
@@ -685,6 +823,18 @@ class Distiller:
                 )
                 ok, detail = False, f"异常：{exc}"
             items.append(DailyItem(spec=spec, ok=ok, detail=detail))
+        # 补齐快照：总结结束后要拿它去同步 AstrBot 人格
+        for item in items:
+            if item.snapshot is not None or not item.ok:
+                continue
+            try:
+                item.snapshot = await self.storage.get_persona(
+                    item.spec.group_id, item.spec.qq_id
+                )
+            except Exception as exc:  # noqa: BLE001 - 读快照失败不影响总结本身
+                logger.error(
+                    "[%s] 读取 %s 的快照失败: %s", self.plugin_name, item.spec.label(), exc
+                )
         return items
 
     async def run_daily_digest(
