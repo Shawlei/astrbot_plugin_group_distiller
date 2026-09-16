@@ -136,7 +136,15 @@ astrbot_plugin_group_distiller/
 │   └── progress.py        # 进度面板 / 档案渲染
 └── tests/
     ├── __init__.py
-    └── test_core.py       # 纯逻辑单元测试（不依赖 AstrBot）
+    ├── test_core.py       # 纯逻辑单元测试（不依赖 AstrBot）
+    └── test_qa_verify.py  # QA 独立复核用例（边界 / 并发 / 落盘路径 / 权限）
+```
+
+跑测试（无需 AstrBot 环境、无需 pytest）：
+
+```bash
+python tests/test_core.py        # 9/9
+python tests/test_qa_verify.py   # 29/29
 ```
 
 数据落盘位置（遵循 AstrBot 规范，数据放 data 目录）：
