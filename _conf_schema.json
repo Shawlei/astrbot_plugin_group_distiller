@@ -1,0 +1,98 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "插件总开关",
+    "hint": "关掉它等于让整个插件睡觉，采集和指令都会停。",
+    "default": true
+  },
+  "target_group_id": {
+    "type": "string",
+    "description": "目标群号",
+    "hint": "要蒸馏谁，就先填他所在的群号；也可以进群用 /zl set 现场设定。",
+    "default": ""
+  },
+  "target_qq_id": {
+    "type": "string",
+    "description": "目标群友 QQ 号",
+    "hint": "被蒸馏的那位群友的 QQ 号，纯数字，别带空格。",
+    "default": ""
+  },
+  "target_nickname": {
+    "type": "string",
+    "description": "目标昵称",
+    "hint": "填了会让提示词更准，留空也行，LLM 大概也能猜。",
+    "default": ""
+  },
+  "listen_enabled": {
+    "type": "bool",
+    "description": "静默采集开关",
+    "hint": "控制是否偷偷记下目标群友的发言，指令 /zl off 也能临时关。",
+    "default": true
+  },
+  "auto_distill": {
+    "type": "bool",
+    "description": "自动蒸馏",
+    "hint": "攒够语料就自动喊一次 LLM 蒸馏，想省 token 就关掉，改成手动 /zl distill。",
+    "default": true
+  },
+  "distill_interval_messages": {
+    "type": "int",
+    "description": "自动蒸馏触发条数",
+    "hint": "每累计这么多条「未蒸馏」语料就触发一轮蒸馏，默认 200。",
+    "default": 200
+  },
+  "distill_batch_messages": {
+    "type": "int",
+    "description": "单轮蒸馏投喂上限",
+    "hint": "一轮最多把多少条语料塞给 LLM，太多会被截断，默认 300。",
+    "default": 300
+  },
+  "saturation_messages": {
+    "type": "int",
+    "description": "进度条饱和基准",
+    "hint": "进度条攒满需要多少条语料，默认 1500。",
+    "default": 1500
+  },
+  "min_message_length": {
+    "type": "int",
+    "description": "最短采集长度",
+    "hint": "比这个还短的消息直接丢掉（比如单个「嗯」），填 0 表示不过滤。",
+    "default": 1
+  },
+  "ignore_commands": {
+    "type": "bool",
+    "description": "忽略指令消息",
+    "hint": "以 / 开头的消息当成指令不采集，避免把命令记进人设。",
+    "default": true
+  },
+  "record_context": {
+    "type": "bool",
+    "description": "记录上下文",
+    "hint": "额外记下目标发言前后各 1 条相邻消息，帮 LLM 理解语境。",
+    "default": true
+  },
+  "llm_provider_id": {
+    "type": "string",
+    "description": "指定 LLM Provider ID",
+    "hint": "想指定某个模型供应商就填它的 ID，留空用当前会话默认 Provider。",
+    "default": ""
+  },
+  "admin_only": {
+    "type": "bool",
+    "description": "指令仅管理员可用",
+    "hint": "开启后只有管理员能敲 /zl，防止路人乱动。",
+    "default": true
+  },
+  "reply_with_at": {
+    "type": "bool",
+    "description": "进度面板 @ 提问者",
+    "hint": "回复时捎带 @ 一下敲指令的人，便于群聊里定位。",
+    "default": true
+  },
+  "custom_prompt_extra": {
+    "type": "text",
+    "description": "追加蒸馏约束",
+    "hint": "会拼接到蒸馏提示词末尾，比如「多关注他吐槽的语气」，可留空。",
+    "default": ""
+  }
+}

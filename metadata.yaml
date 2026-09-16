@@ -1,0 +1,10 @@
+name: astrbot_plugin_group_distiller
+display_name: 我要蒸馏群友
+short_desc: 把指定群友静默蒸馏成 5 层 AI 人格档案（Persona）
+desc: >
+  灵感来自 pig-skill：静默采集某个群友的聊天语料，调用 LLM 蒸馏出 5 层 Persona
+  （硬规则 / 身份 / 表达风格 / 聊天行为模式 / 兴趣偏好），支持增量 merge、
+  证据溯源、纠正层与群内 /zl 进度查询。仅供娱乐，请勿用于侵犯他人隐私。
+version: v0.1.0
+author: Shawlei
+repo: https://github.com/Shawlei/astrbot_plugin_group_distiller
