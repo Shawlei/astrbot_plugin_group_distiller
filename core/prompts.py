@@ -398,3 +398,185 @@ def render_export_markdown(
     md.append("")
 
     return "\n".join(md)
+
+
+# --------------------------------------------------------------------------- #
+# AstrBot 人格模板（把蒸馏结果「搬进」AstrBot 的人格设定）
+# --------------------------------------------------------------------------- #
+
+# 人格模板里 5 层对应的自然语言标题。与 LAYER_TITLES 的「Layer N · xxx」不同，
+# 这里是写给模型看的第二人称指令，语气更像在交代一个角色怎么演。
+PERSONA_SECTION_TITLES: dict[str, str] = {
+    "layer1_rules": "一、说话的铁律（最高优先级，任何情况都不能违背）",
+    "layer2_identity": "二、我是谁",
+    "layer3_style": "三、我平常怎么说话",
+    "layer4_behavior": "四、我在群里怎么跟人互动",
+    "layer5_interests": "五、我喜欢什么、讨厌什么",
+}
+
+# 某一层没证据时的占位提示。刻意写成「别硬演」，避免模型凭空空想出人格。
+PERSONA_EMPTY_HINT = "（这部分语料里看不出来，就按一个普通群友的方式自然应对，别硬演。）"
+
+# 人格模板的固定开场白
+PERSONA_OPENING = """你现在就是「{nickname}」——一个实实在在存在过的 QQ 群友，不是 AI，不是助手。
+下面是别人根据 {qq} 的聊天记录给你整理的人格档案。请完全第一人称代入，
+用它的语气、习惯和脾气说话。
+
+【扮演铁律】
+1. 你就是{nickname}本友。绝不要说自己是 AI、大模型、机器人或助手，
+   也不要提"扮演""设定""人格档案"这类词。
+2. 时刻守住下面的说话习惯。哪怕别人问你正经问题，也要用它的方式回答，
+   而不是突然切换成客客气气的百科口吻。
+3. 拿不准的事就用它的方式含糊、吐槽或者转移话题过去，不要忽然变得很专业。
+4. 档案里没写的性格，不要自己发明。宁可少说、也别演歪。"""
+
+
+def _persona_bullets(
+    items: Sequence[Any], include_evidence: bool, fallback: str = PERSONA_EMPTY_HINT
+) -> list[str]:
+    """把某一层的结论渲染成 Markdown 无序列表。
+
+    Args:
+        items: 该层的条目（dict 或字符串）。
+        include_evidence: 是否附上原话样张。
+        fallback: 该层无内容时的占位行。
+
+    Returns:
+        若干行文本；无内容时返回单行 ``fallback``。
+    """
+    if not items:
+        return [f"- {fallback}"]
+
+    lines: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            line = f"- {text}"
+            if item.get("conflict"):
+                line += "（这条的判断有争议，语气上别太笃定）"
+            if include_evidence:
+                quotes = [str(q).strip() for q in (item.get("quotes") or []) if str(q).strip()]
+                if quotes:
+                    line += f"　例：{' / '.join(quotes[:2])}"
+        else:
+            text = str(item).strip()
+            if not text:
+                continue
+            line = f"- {text}"
+        lines.append(line)
+
+    return lines or [f"- {fallback}"]
+
+
+def build_astrbot_persona(
+    snapshot: Optional[dict[str, Any]],
+    nickname: str,
+    qq: str,
+    *,
+    include_evidence: bool = False,
+    extra_rules: str = "",
+    plugin_name: str = "我要蒸馏群友",
+) -> str:
+    """把 Persona 快照渲染成可直接粘贴进 AstrBot「人格设定」的系统提示词。
+
+    产出是一段纯文本（AstrBot 人格的 ``prompt`` 字段就是要这种系统提示词）。
+    设计上刻意分两层：**扮演铁律**放最前面（模型对开头最敏感），
+    5 层结论随后展开，来源与局限放在最后的注释里。
+
+    Args:
+        snapshot: Persona 快照。
+        nickname: 目标昵称。
+        qq: 目标 QQ。
+        include_evidence: 是否把代表性原话附在结论后面。
+        extra_rules: 使用者在配置里追加的额外规矩。
+        plugin_name: 用于生成来源注释。
+
+    Returns:
+        人格模板文本。快照为空时也会返回一份（只是内容全是"证据不足"）。
+    """
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    layers = snap.get("layers") if isinstance(snap.get("layers"), dict) else {}
+    meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
+    corrections = [str(c).strip() for c in (snap.get("corrections") or []) if str(c).strip()]
+    uncertainty = [str(u).strip() for u in (snap.get("uncertainty") or []) if str(u).strip()]
+
+    display = (nickname or "").strip() or "群友"
+
+    lines: list[str] = []
+    lines.append(PERSONA_OPENING.format(nickname=display, qq=qq or "未知"))
+    lines.append("")
+
+    for key in LAYER_KEYS:
+        lines.append(f"## {PERSONA_SECTION_TITLES[key]}")
+        lines.extend(_persona_bullets(layers.get(key) or [], include_evidence))
+        lines.append("")
+
+    lines.append("## 六、人工纠正（优先级高于上面的所有推断）")
+    if corrections:
+        lines.extend(f"- {c}" for c in corrections)
+    else:
+        lines.append("- （暂无。上面的推断如有偏差，请用「/zl 纠正 <内容>」补一条。）")
+    lines.append("")
+
+    extra = (extra_rules or "").strip()
+    if extra:
+        lines.append("## 七、主人额外交代的规矩")
+        lines.append(f"- {extra}")
+        lines.append("")
+
+    if uncertainty:
+        lines.append("## 八、留个心（这些地方证据不足，别看太重）")
+        lines.extend(f"- {u}" for u in uncertainty)
+        lines.append("")
+
+    total = int(meta.get("total_messages", 0) or 0)
+    round_no = int(meta.get("distill_round", 0) or 0)
+    generated = _fmt_ts(meta.get("last_distill_at", 0)) if meta.get("last_distill_at") else "未蒸馏过"
+    lines.append("---")
+    lines.append(
+        f"（本模板由「{plugin_name}」依据 {total} 条群聊语料、第 {round_no} 轮蒸馏自动生成 · "
+        f"目标 QQ {qq or '未知'} · 最后蒸馏 {generated}）"
+    )
+    lines.append(
+        "（⚠️ 内容由 AI 推断，可能不准；仅供娱乐，请勿用于侵犯他人隐私或任何歧视性用途。）"
+    )
+    return "\n".join(lines)
+
+
+def build_persona_summary(
+    snapshot: Optional[dict[str, Any]], nickname: str, qq: str
+) -> str:
+    """渲染人格模板的"体检报告"：能不能用了、还缺什么。
+
+    用于 ``/zl persona`` 的头部提示，帮使用者判断现在搬进 AstrBot 是否合适。
+    """
+    layers = {}
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("layers"), dict):
+        layers = snapshot["layers"]
+    formed = [key for key in LAYER_KEYS if layers.get(key)]
+    missing = [key for key in LAYER_KEYS if not layers.get(key)]
+
+    if not snapshot:
+        return (
+            f"⚠️ {nickname or '目标'} 还没有任何档案，现在生成的人格模板基本是空壳。\n"
+            "建议先攒语料、跑一轮 /zl distill 再来。"
+        )
+
+    tip = "✅ 可以直接搬进 AstrBot 了。" if not missing else "🟡 还能用，但有几层证据不足。"
+    lines = [
+        f"🧬 {nickname or '目标'}（{qq}）人格模板体检",
+        SEP_LINE,
+        f"成型层数：{len(formed)}/{len(LAYER_KEYS)}",
+    ]
+    if formed:
+        lines.append("已有：" + "、".join(LAYER_TITLES[k] for k in formed))
+    if missing:
+        lines.append("缺少：" + "、".join(LAYER_TITLES[k] for k in missing))
+    lines.append(tip)
+    return "\n".join(lines)
+
+
+# 供 build_persona_summary 使用的分隔线（与 progress.SEP 保持同一视觉）
+SEP_LINE = "──────────────────────────"

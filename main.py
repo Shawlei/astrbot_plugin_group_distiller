@@ -1,10 +1,11 @@
 """AstrBot 插件主入口：我要蒸馏群友（astrbot_plugin_group_distiller）。
 
-静默采集指定群友的聊天语料，调用 LLM 蒸馏成 5 层 AI 人格档案，
-并通过 ``/zl`` 指令族在群内查看进度与档案。
+静默采集多个「群 + 群友」目标的聊天语料，调用 LLM 蒸馏成 5 层 AI 人格档案，
+通过 ``/zl`` 指令族在群内查看进度、管理目标，并把蒸馏结果生成 / 写入
+AstrBot 的「人格设定」。
 
 作者：Shawlei
-版本：v0.1.0
+版本：v0.2.0
 仓库：https://github.com/Shawlei/astrbot_plugin_group_distiller
 """
 
@@ -20,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
 try:  # 兼容包内导入 / 顶层导入两种加载方式
-    from .core import progress, prompts
+    from .core import persona_bridge, progress, prompts, targets as targets_mod
     from .core.collector import Collector, RuntimeState
     from .core.distiller import (
         Distiller,
@@ -29,8 +30,10 @@ try:  # 兼容包内导入 / 顶层导入两种加载方式
         empty_snapshot,
     )
     from .core.storage import Storage, resolve_plugin_data_dir
+    from .core.targets import TargetSpec
 except ImportError:  # pragma: no cover
-    from core import progress, prompts  # type: ignore
+    from core import persona_bridge, progress, prompts  # type: ignore
+    from core import targets as targets_mod  # type: ignore
     from core.collector import Collector, RuntimeState  # type: ignore
     from core.distiller import (  # type: ignore
         Distiller,
@@ -39,12 +42,22 @@ except ImportError:  # pragma: no cover
         empty_snapshot,
     )
     from core.storage import Storage, resolve_plugin_data_dir  # type: ignore
+    from core.targets import TargetSpec  # type: ignore
 
 PLUGIN_NAME = "astrbot_plugin_group_distiller"
 PLUGIN_DISPLAY = "我要蒸馏群友"
+PLUGIN_VERSION = "v0.2.0"
 
 # 可能出现在 message_str 开头的指令前缀（AstrBot 有时会剥离，有时不会）
 _PREFIXES = ("/zl", "zl", "／zl", "/蒸馏", "蒸馏", "／蒸馏")
+
+# 目标管理的子命令别名
+_HEADS_LIST = ("list", "ls", "列表", "目标", "清单")
+_HEADS_ADD = ("add", "添加", "新增", "加")
+_HEADS_DEL = ("del", "delete", "remove", "rm", "删", "删除")
+_HEADS_USE = ("use", "switch", "切换", "选中")
+_HEADS_PERSONA = ("persona", "人格", "模板", "人格模板")
+_HEADS_PUSH = ("push", "写入", "应用", "装进人格")
 
 
 def _parse_command(raw: str) -> tuple[str, str]:
@@ -85,7 +98,7 @@ async def _write_text(path: Path, text: str) -> None:
     await asyncio.to_thread(path.write_text, text, "utf-8")
 
 
-@register(PLUGIN_NAME, "Shawlei", "把群友蒸馏成 AI 人格档案", "v0.1.0")
+@register(PLUGIN_NAME, "Shawlei", "把群友蒸馏成 AI 人格档案", PLUGIN_VERSION)
 class GroupDistillerPlugin(Star):
     """群友蒸馏插件主类。"""
 
@@ -104,19 +117,22 @@ class GroupDistillerPlugin(Star):
     # ------------------------------------------------------------------ #
 
     async def initialize(self) -> None:
-        """插件实例化后自动调用：初始化存储、加载状态、启动采集。"""
+        """插件实例化后自动调用：初始化存储、加载目标、启动采集。"""
         try:
             await self.storage.init()
             await self._load_runtime_state()
-            if self.state.has_target():
-                self.state.total_messages = await self.storage.count_messages(
-                    self.state.group_id, self.state.qq_id
-                )
-                self.state.undistilled = await self.storage.count_undistilled(
-                    self.state.group_id, self.state.qq_id
-                )
+            await self._refresh_counts()
+            self.distiller.set_on_distilled(self._on_distilled)
             await self.collector.start()
-            logger.info("[%s] 初始化完成，目标=%s/%s", PLUGIN_NAME, self.state.group_id, self.state.qq_id)
+            logger.info(
+                "[%s] %s 初始化完成：%d 个目标，当前 %s",
+                PLUGIN_NAME,
+                PLUGIN_VERSION,
+                len(self.state.targets),
+                self.state.active_target().label()
+                if self.state.active_target()
+                else "无",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("[%s] 初始化失败: %s", PLUGIN_NAME, exc, exc_info=True)
 
@@ -186,18 +202,51 @@ class GroupDistillerPlugin(Star):
                 async for reply in self._handle_set(event, rest):
                     yield reply
 
-            elif head in ("now", "目标"):
+            elif head in _HEADS_ADD:
+                async for reply in self._handle_add(event, rest):
+                    yield reply
+
+            elif head in _HEADS_DEL:
+                async for reply in self._handle_del(event, rest):
+                    yield reply
+
+            elif head in _HEADS_USE:
+                async for reply in self._handle_use(event, rest):
+                    yield reply
+
+            elif head in _HEADS_LIST:
+                yield self._reply(event, await self._render_target_list())
+
+            elif head in ("now",):
                 yield self._reply(event, self._render_target())
 
             elif head in ("distill", "蒸馏", "开始"):
-                result = await self.distiller.trigger(event.unified_msg_origin, manual=True)
+                all_targets = rest.strip().lower() in ("all", "全部", "所有", "全")
+                result = await self.distiller.trigger(
+                    event.unified_msg_origin, manual=True, all_targets=all_targets
+                )
                 yield self._reply(event, result.message)
 
             elif head in ("profile", "档案", "画像"):
                 snapshot = await self._load_snapshot()
+                active = self.state.active_target()
                 yield self._reply(
-                    event, progress.render_profile(snapshot, self.state.nickname, self.state.qq_id)
+                    event,
+                    progress.render_profile(
+                        snapshot,
+                        self.state.nickname,
+                        self.state.qq_id,
+                        active.group_id if active else "",
+                    ),
                 )
+
+            elif head in _HEADS_PERSONA:
+                async for reply in self._handle_persona(event):
+                    yield reply
+
+            elif head in _HEADS_PUSH:
+                async for reply in self._handle_push(event):
+                    yield reply
 
             elif head in ("export", "导出"):
                 async for reply in self._handle_export(event):
@@ -223,159 +272,372 @@ class GroupDistillerPlugin(Star):
             yield event.plain_result("😵 指令处理出错，请查看后台日志。")
 
     # ------------------------------------------------------------------ #
-    # 子命令处理
+    # 目标管理子命令
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _split_target_args(rest: str, event: AstrMessageEvent) -> tuple[str, str, str]:
+        """把 ``rest`` 解析成 ``(群号, QQ号, 昵称)``。
+
+        支持 ``<群号> <QQ号> [昵称]`` 与 ``<QQ号> [昵称]``（用当前群）两种写法。
+        昵称允许带空格，因此第三段取剩余整串。
+        """
+        parts = rest.split(maxsplit=2)
+        if not parts:
+            return "", "", ""
+        if len(parts) == 1:
+            return str(event.get_group_id() or ""), parts[0], ""
+        nickname = parts[2] if len(parts) > 2 else ""
+        return parts[0], parts[1], nickname
+
     async def _handle_set(self, event: AstrMessageEvent, rest: str):
-        """``/zl set <群号> <QQ号>`` 或 ``/zl set <QQ号>``。"""
+        """``/zl set <群号> <QQ号>``：**替换**目标列表（保留原有语料与档案）。"""
         tokens = rest.split()
         if not tokens:
             yield self._reply(event, "用法：/zl set <群号> <QQ号>，或 /zl set <QQ号>（当前群）")
             return
 
-        if len(tokens) == 1:
-            group_id = str(event.get_group_id() or "")
-            qq = tokens[0]
-            nickname = ""
-            if not group_id:
-                yield self._reply(event, "⚠️ 不在群里，请补上群号：/zl set <群号> <QQ号>")
-                return
-        else:
-            group_id = tokens[0]
-            qq = tokens[1]
-            nickname = tokens[2] if len(tokens) > 2 else ""
-
-        if not group_id.isdigit():
-            yield self._reply(event, "⚠️ 群号必须是纯数字。")
+        group_id, qq, nickname = self._split_target_args(rest, event)
+        if not group_id:
+            yield self._reply(event, "⚠️ 不在群里，请补上群号：/zl set <群号> <QQ号>")
             return
-        if not qq.isdigit():
-            yield self._reply(event, "⚠️ QQ 号必须是纯数字。")
+        error = self._validate_ids(group_id, qq)
+        if error:
+            yield self._reply(event, error)
             return
 
-        self.state.group_id = group_id
-        self.state.qq_id = qq
-        if nickname:
-            self.state.nickname = nickname
-        await self._persist_state()
-
-        # 切换目标后刷新计数缓存
-        self.state.total_messages = await self.storage.count_messages(group_id, qq)
-        self.state.undistilled = await self.storage.count_undistilled(group_id, qq)
+        spec = TargetSpec(group_id=group_id, qq_id=qq, nickname=nickname)
+        self.state.clear_targets()
+        self.state.add_target(spec)
+        self.state.set_active(spec.key)
+        await self._after_target_change()
 
         yield self._reply(
             event,
-            f"🎯 目标已设定：{self.state.nickname or '未知昵称'} "
-            f"({qq}) @ 群 {group_id}\n现有语料 {self.state.total_messages} 条。",
+            f"🎯 目标已设定（已替换原有清单）：{spec.label()}\n"
+            f"现有语料 {self.state.total_messages} 条。\n"
+            "想同时蒸馏多个人，请改用 /zl add。",
         )
 
+    async def _handle_add(self, event: AstrMessageEvent, rest: str):
+        """``/zl add <群号> <QQ号> [昵称]``：追加一个目标。"""
+        if not rest.strip():
+            yield self._reply(
+                event,
+                "用法：/zl add <群号> <QQ号> [昵称]，或 /zl add <QQ号> [昵称]（当前群）",
+            )
+            return
+
+        group_id, qq, nickname = self._split_target_args(rest, event)
+        if not group_id:
+            yield self._reply(event, "⚠️ 不在群里，请补上群号：/zl add <群号> <QQ号>")
+            return
+        error = self._validate_ids(group_id, qq)
+        if error:
+            yield self._reply(event, error)
+            return
+
+        spec = TargetSpec(group_id=group_id, qq_id=qq, nickname=nickname)
+        existed = any(t.key == spec.key for t in self.state.targets)
+        self.state.add_target(spec)
+        if not existed:
+            self.state.set_active(spec.key)
+        await self._after_target_change()
+
+        verb = "已更新" if existed else "已添加"
+        yield self._reply(
+            event,
+            f"{'♻️' if existed else '➕'} 目标{verb}：{spec.label()}\n"
+            f"当前共 {len(self.state.targets)} 个目标，"
+            f"当前选中 {(self.state.active_target() or spec).label()}。",
+        )
+
+    async def _handle_del(self, event: AstrMessageEvent, rest: str):
+        """``/zl del <QQ号> [purge]``：删除目标；加 purge 连语料与档案一起删。"""
+        parts = rest.split()
+        if not parts:
+            yield self._reply(event, "用法：/zl del <QQ号> [purge]")
+            return
+
+        qq = parts[0]
+        purge = len(parts) > 1 and parts[1].lower() in (
+            "purge",
+            "彻底",
+            "清除",
+            "全部",
+            "清空",
+        )
+        if not targets_mod.is_valid_id(qq):
+            yield self._reply(event, "⚠️ QQ 号必须是纯数字（5~20 位）。")
+            return
+
+        doomed = [t for t in self.state.collect_targets() if t.qq_id == qq]
+        if not doomed:
+            yield self._reply(event, f"🤔 没找到 QQ 号为 {qq} 的目标，用 /zl list 看看。")
+            return
+
+        removed = self.state.remove_target(qq)
+        for spec in doomed:
+            self.state.overview.pop(spec.key, None)
+            if purge:
+                await self.storage.clear_messages(spec.group_id, spec.qq_id)
+                await self.storage.delete_persona(spec.group_id, spec.qq_id)
+        await self._after_target_change()
+
+        tail = "（语料与档案已一并删除）" if purge else "（语料与档案仍保留在库里）"
+        yield self._reply(
+            event,
+            f"🗑️ 已删除 {removed} 个目标{tail}。\n"
+            f"剩余 {len(self.state.targets)} 个目标。",
+        )
+
+    async def _handle_use(self, event: AstrMessageEvent, rest: str):
+        """``/zl use <QQ号>``：切换当前选中目标。"""
+        key = rest.strip()
+        if not key:
+            yield self._reply(event, "用法：/zl use <QQ号>")
+            return
+        if not self.state.set_active(key):
+            yield self._reply(event, f"🤔 没找到目标「{key}」，用 /zl list 看看。")
+            return
+        await self._refresh_counts()
+        await self._persist_state()
+        active = self.state.active_target()
+        yield self._reply(
+            event,
+            f"🎯 已切换到：{active.label() if active else key}\n"
+            f"该目标现有语料 {self.state.total_messages} 条。",
+        )
+
+    async def _handle_persona(self, event: AstrMessageEvent):
+        """``/zl persona``：生成可粘贴进 AstrBot 的人格模板。"""
+        active = self.state.active_target()
+        if active is None:
+            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。")
+            return
+
+        snapshot = await self._load_snapshot()
+        persona_id = self._persona_id(active)
+        template = self._build_persona_text(active, snapshot)
+        chunks = progress.chunk_text(template)
+
+        yield self._reply(
+            event,
+            prompts.build_persona_summary(snapshot, active.display_name, active.qq_id),
+        )
+        yield self._reply(
+            event,
+            progress.render_persona_header(
+                active.display_name, active.qq_id, active.group_id, persona_id, len(chunks)
+            ),
+        )
+        for chunk in chunks:
+            yield event.plain_result(chunk)
+
+    async def _handle_push(self, event: AstrMessageEvent):
+        """``/zl push``：把人格模板直接写进 AstrBot 人格设定。"""
+        active = self.state.active_target()
+        if active is None:
+            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。")
+            return
+
+        snapshot = await self._load_snapshot()
+        if not snapshot:
+            yield self._reply(
+                event, "⚠️ 这个目标还没有档案，先攒语料并跑一轮 /zl distill。"
+            )
+            return
+
+        persona_id = self._persona_id(active)
+        text = self._build_persona_text(active, snapshot)
+        ok, message = await persona_bridge.push_persona(self.context, persona_id, text)
+
+        if ok:
+            yield self._reply(
+                event,
+                f"🪪 {message}\n"
+                "去 AstrBot WebUI 的「人格设定」里就能看到它，"
+                "在会话配置里选中即可生效。",
+            )
+        else:
+            yield self._reply(
+                event,
+                f"😵 {message}\n"
+                "（可以改用 /zl persona 拿到模板，手动粘进「人格设定」）",
+            )
+
+    # ------------------------------------------------------------------ #
+    # 其他子命令
+    # ------------------------------------------------------------------ #
+
     async def _handle_export(self, event: AstrMessageEvent):
-        """``/zl export``：导出 Markdown 到数据目录。"""
-        if not self.state.has_target():
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl set。")
+        """``/zl export``：导出 Markdown 档案 + 人格模板到数据目录。"""
+        active = self.state.active_target()
+        if active is None:
+            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add。")
             return
         try:
             snapshot = await self._load_snapshot() or empty_snapshot()
             markdown = prompts.render_export_markdown(
-                snapshot, self.state.nickname, self.state.qq_id, PLUGIN_DISPLAY
+                snapshot, active.display_name, active.qq_id, PLUGIN_DISPLAY
             )
+            persona_text = self._build_persona_text(active, snapshot)
+
             out_dir = resolve_plugin_data_dir()
-            path = out_dir / f"persona_{self.state.qq_id}.md"
-            await _write_text(path, markdown)
-            preview = markdown[:600]
-            yield self._reply(event, f"📄 已导出到：{path}\n\n{preview}\n\n……（预览已截断）")
+            md_path = out_dir / f"persona_{active.qq_id}.md"
+            await _write_text(md_path, markdown)
+            persona_path = await persona_bridge.export_persona_file(
+                out_dir, active, persona_text
+            )
+
+            persona_line = f"\n🪪 人格模板：{persona_path}" if persona_path else ""
+            yield self._reply(
+                event,
+                f"📄 已导出：{md_path}{persona_line}\n\n{markdown[:600]}\n\n……（预览已截断）",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("[%s] 导出失败: %s", PLUGIN_NAME, exc, exc_info=True)
             yield self._reply(event, "😵 导出失败，请查看后台日志。")
 
     async def _handle_correct(self, event: AstrMessageEvent, rest: str):
         """``/zl correct <内容>`` / ``/zl 纠正 <内容>``。"""
-        if not self.state.has_target():
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl set。")
+        active = self.state.active_target()
+        if active is None:
+            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add。")
             return
         content = rest.strip()
         if not content:
             yield self._reply(event, "用法：/zl correct <要纠正的内容>")
             return
-        ok = await self.storage.add_correction(self.state.group_id, self.state.qq_id, content)
+        ok = await self.storage.add_correction(active.group_id, active.qq_id, content)
         if ok:
             yield self._reply(event, f"✅ 已记下纠正（优先级最高）：\n- {content}")
         else:
             yield self._reply(event, "😵 写入纠正失败，请查看后台日志。")
 
     async def _handle_reset(self, event: AstrMessageEvent, rest: str):
-        """``/zl reset confirm``：二次确认后清空语料。"""
-        if not self.state.has_target():
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl set。")
+        """``/zl reset confirm``：二次确认后清空当前目标的语料。"""
+        active = self.state.active_target()
+        if active is None:
+            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add。")
             return
         if rest.strip().lower() not in ("confirm", "确认", "yes", "y"):
             yield self._reply(
                 event,
-                "⚠️ 该操作会清空该目标的全部语料（档案保留）。\n"
+                f"⚠️ 该操作会清空 {active.label()} 的全部语料（档案保留）。\n"
                 "确认无误请再次发送：/zl reset confirm",
             )
             return
-        removed = await self.storage.clear_messages(self.state.group_id, self.state.qq_id)
-        self.state.total_messages = 0
-        self.state.undistilled = 0
+        removed = await self.storage.clear_messages(active.group_id, active.qq_id)
+        await self._refresh_counts()
         yield self._reply(event, f"🧹 已清空 {removed} 条语料。（人格档案与纠正层仍保留）")
 
     # ------------------------------------------------------------------ #
-    # 渲染与工具
+    # 渲染
     # ------------------------------------------------------------------ #
 
     async def _build_panel(self) -> str:
         """组装并渲染进度面板。"""
-        if not self.state.has_target():
+        specs = self.state.collect_targets()
+        if not specs:
             return progress.render_no_target()
 
+        for spec in specs:
+            await self._ensure_counts(spec)
+
+        active = self.state.active_target() or specs[0]
         snapshot = await self._load_snapshot()
         meta = snapshot.get("meta", {}) if isinstance(snapshot, dict) else {}
-        min_ts, max_ts = await self.storage.get_time_span(
-            self.state.group_id, self.state.qq_id
-        )
+        min_ts, max_ts = await self.storage.get_time_span(active.group_id, active.qq_id)
+        counts = self.state.counts_for(active)
+
+        rows: list[progress.TargetRow] = []
+        if len(specs) > 1:
+            rows = await self._build_rows(specs, active.key)
 
         data = progress.PanelData(
             plugin_name=PLUGIN_DISPLAY,
             has_target=True,
-            nickname=self.state.nickname,
-            qq=self.state.qq_id,
-            group_id=self.state.group_id,
+            nickname=active.display_name,
+            qq=active.qq_id,
+            group_id=active.group_id,
             distilling=self.distiller.is_running(),
             listen=bool(self.state.enabled and self.state.listen_enabled),
-            total=self.state.total_messages,
+            total=counts["total"],
             saturation=self._safe_int(self.config.get("saturation_messages", 1500), 1500),
             round_no=int(meta.get("distill_round", 0) or 0),
             last_distill_ts=int(meta.get("last_distill_at", 0) or 0),
-            queue=self.state.undistilled,
+            queue=counts["undistilled"],
             min_ts=min_ts,
             max_ts=max_ts,
             completeness=compute_completeness(snapshot),
             formed_layers=count_formed_layers(snapshot),
             total_layers=len(prompts.LAYER_KEYS),
+            targets=rows,
         )
         return progress.render_panel(data)
 
+    async def _build_rows(
+        self, specs: list[TargetSpec], active_key: str
+    ) -> list[progress.TargetRow]:
+        """为目标清单构建渲染行（含各目标的轮次与完整度）。"""
+        current = self.distiller.current_target()
+        rows: list[progress.TargetRow] = []
+        for spec in specs:
+            await self._ensure_counts(spec)
+            snapshot = await self.storage.get_persona(spec.group_id, spec.qq_id)
+            meta = snapshot.get("meta", {}) if isinstance(snapshot, dict) else {}
+            counts = self.state.counts_for(spec)
+            rows.append(
+                progress.TargetRow(
+                    key=spec.key,
+                    nickname=spec.display_name,
+                    qq=spec.qq_id,
+                    group_id=spec.group_id,
+                    total=counts["total"],
+                    undistilled=counts["undistilled"],
+                    round_no=int(meta.get("distill_round", 0) or 0),
+                    completeness=compute_completeness(snapshot),
+                    active=spec.key == active_key,
+                    distilling=bool(current and current.key == spec.key),
+                    has_persona=bool(snapshot),
+                )
+            )
+        return rows
+
+    async def _render_target_list(self) -> str:
+        """渲染 ``/zl list``。"""
+        specs = self.state.collect_targets()
+        if not specs:
+            return progress.render_target_list([])
+        for spec in specs:
+            await self._ensure_counts(spec)
+        rows = await self._build_rows(specs, self.state.active_key)
+        return progress.render_target_list(rows, self.state.active_key)
+
     def _render_target(self) -> str:
         """渲染 ``/zl now`` 的目标信息。"""
-        if not self.state.has_target():
-            return "❗ 当前还没有设定目标。用 /zl set <群号> <QQ号> 设定。"
+        specs = self.state.collect_targets()
+        if not specs:
+            return "❗ 当前还没有设定目标。用 /zl add <群号> <QQ号> 添加。"
+        active = self.state.active_target()
         listen = "开启" if (self.state.enabled and self.state.listen_enabled) else "关闭"
-        return (
-            f"🎯 当前目标：{self.state.nickname or '未知昵称'} ({self.state.qq_id})\n"
-            f"🏠 目标群：{self.state.group_id}\n"
-            f"📡 采集状态：{listen}"
-        )
+        lines = [
+            f"🎯 当前目标：{active.label() if active else '未知'}",
+            f"📡 采集状态：{listen}",
+            f"📋 目标总数：{len(specs)} 个（/zl list 看全部）",
+        ]
+        return "\n".join(lines)
 
-    async def _load_snapshot(self) -> Optional[dict[str, Any]]:
+    async def _load_snapshot(self, spec: Optional[TargetSpec] = None) -> Optional[dict[str, Any]]:
         """读取 Persona 快照，并注入最新的人工纠正层。"""
-        if not self.state.has_target():
+        target = spec or self.state.active_target()
+        if target is None:
             return None
-        snapshot = await self.storage.get_persona(self.state.group_id, self.state.qq_id)
+        snapshot = await self.storage.get_persona(target.group_id, target.qq_id)
         if snapshot is None:
             return None
-        corrections = await self.storage.get_corrections(
-            self.state.group_id, self.state.qq_id
-        )
+        corrections = await self.storage.get_corrections(target.group_id, target.qq_id)
         snapshot["corrections"] = corrections
         return snapshot
 
@@ -388,6 +650,104 @@ class GroupDistillerPlugin(Star):
             except Exception:  # noqa: BLE001 - 组装富媒体失败则退化纯文本
                 pass
         return event.plain_result(text)
+
+    # ------------------------------------------------------------------ #
+    # 人格模板
+    # ------------------------------------------------------------------ #
+
+    def _persona_cfg(self) -> dict[str, Any]:
+        """读取并规整「人格模板」这一段配置。"""
+        raw = self.config.get("persona_template")
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "prefix": str(raw.get("persona_id_prefix", "") or ""),
+            "auto_write": bool(raw.get("auto_write", False)),
+            "auto_write_threshold": self._safe_int(
+                raw.get("auto_write_threshold", 80), 80
+            ),
+            "include_evidence": bool(raw.get("include_evidence", False)),
+            "extra_rules": str(raw.get("extra_rules", "") or ""),
+        }
+
+    def _persona_id(self, spec: TargetSpec) -> str:
+        """算出该目标对应的人格 ID。"""
+        return persona_bridge.make_persona_id(
+            self._persona_cfg()["prefix"], spec.nickname, spec.qq_id, spec.group_id
+        )
+
+    def _build_persona_text(
+        self, spec: TargetSpec, snapshot: Optional[dict[str, Any]]
+    ) -> str:
+        """生成可粘贴 / 可写入 AstrBot 的人格模板文本。"""
+        cfg = self._persona_cfg()
+        return prompts.build_astrbot_persona(
+            snapshot,
+            spec.display_name,
+            spec.qq_id,
+            include_evidence=cfg["include_evidence"],
+            extra_rules=cfg["extra_rules"],
+            plugin_name=PLUGIN_DISPLAY,
+        )
+
+    async def _on_distilled(
+        self, spec: TargetSpec, snapshot: dict[str, Any]
+    ) -> None:
+        """蒸馏完成回调：达到完整度阈值就自动写入 AstrBot 人格。"""
+        cfg = self._persona_cfg()
+        if not (cfg["enabled"] and cfg["auto_write"]):
+            return
+        completeness = compute_completeness(snapshot)
+        if completeness < cfg["auto_write_threshold"]:
+            return
+
+        persona_id = self._persona_id(spec)
+        text = self._build_persona_text(spec, snapshot)
+        ok, message = await persona_bridge.push_persona(self.context, persona_id, text)
+        if ok:
+            logger.info(
+                "[%s] 档案完整度 %d%% 达标，%s", PLUGIN_NAME, completeness, message
+            )
+        else:
+            logger.warning("[%s] 自动写入人格失败：%s", PLUGIN_NAME, message)
+
+    # ------------------------------------------------------------------ #
+    # 状态与工具
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _validate_ids(group_id: str, qq: str) -> str:
+        """校验群号与 QQ 号，合法返回空串，否则返回给用户看的错误文案。"""
+        if not targets_mod.is_valid_id(group_id):
+            return "⚠️ 群号必须是纯数字（5~20 位）。"
+        if not targets_mod.is_valid_id(qq):
+            return "⚠️ QQ 号必须是纯数字（5~20 位）。"
+        return ""
+
+    async def _after_target_change(self) -> None:
+        """目标集合变动后的统一收尾：刷新计数、持久化、同步镜像字段。"""
+        self.state.sync_active_fields()
+        await self._refresh_counts()
+        await self._persist_state()
+
+    async def _ensure_counts(self, spec: TargetSpec) -> None:
+        """确保某个目标的计数缓存存在（缺失才查库）。"""
+        if spec.key not in self.state.overview:
+            await self._refresh_counts([spec])
+
+    async def _refresh_counts(self, specs: Optional[list[TargetSpec]] = None) -> None:
+        """用数据库统计刷新目标计数缓存。"""
+        for spec in specs if specs is not None else self.state.collect_targets():
+            try:
+                total = await self.storage.count_messages(spec.group_id, spec.qq_id)
+                undistilled = await self.storage.count_undistilled(
+                    spec.group_id, spec.qq_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[%s] 刷新计数失败: %s", PLUGIN_NAME, exc)
+                continue
+            self.state.set_counts(spec.key, total, undistilled)
 
     @staticmethod
     def _is_admin(event: AstrMessageEvent) -> bool:
@@ -406,33 +766,54 @@ class GroupDistillerPlugin(Star):
             return default
 
     async def _load_runtime_state(self) -> None:
-        """从配置初始化运行时状态，再用持久化覆盖（指令修改优先）。"""
+        """加载目标与开关：配置打底，数据库中的运行期改动覆盖之。"""
         self.state.enabled = bool(self.config.get("enabled", True))
         self.state.listen_enabled = bool(self.config.get("listen_enabled", True))
-        self.state.group_id = str(self.config.get("target_group_id", "") or "")
-        self.state.qq_id = str(self.config.get("target_qq_id", "") or "")
-        self.state.nickname = str(self.config.get("target_nickname", "") or "")
+
+        cfg_targets, warnings = targets_mod.collect_config_targets(self.config)
+        for warning in warnings:
+            logger.warning("[%s] 目标清单：%s", PLUGIN_NAME, warning)
+
+        stored = targets_mod.targets_from_json(await self.storage.get_state("rt_targets"))
+        if stored:
+            # 运行期通过 /zl add、/zl del 改过的清单优先
+            self.state.targets = stored
+        else:
+            self.state.targets = list(cfg_targets)
+
+        # v0.1.0 遗留：库里只有一个单目标的 state
+        if not self.state.targets:
+            legacy = targets_mod.make_target(
+                await self.storage.get_state("rt_target_group_id"),
+                await self.storage.get_state("rt_target_qq_id"),
+                await self.storage.get_state("rt_target_nickname") or "",
+            )
+            if legacy is not None:
+                self.state.targets = [legacy]
+
+        stored_active = await self.storage.get_state("rt_active_key")
+        if not (stored_active and self.state.set_active(stored_active)):
+            if self.state.targets:
+                self.state.set_active(self.state.targets[0].key)
+        self.state.sync_active_fields()
 
         for store_key, attr in (
-            ("rt_target_group_id", "group_id"),
-            ("rt_target_qq_id", "qq_id"),
-            ("rt_target_nickname", "nickname"),
+            ("rt_enabled", "enabled"),
+            ("rt_listen_enabled", "listen_enabled"),
         ):
-            stored = await self.storage.get_state(store_key)
-            if stored is not None:
-                setattr(self.state, attr, stored)
-
-        for store_key, attr in (("rt_enabled", "enabled"), ("rt_listen_enabled", "listen_enabled")):
-            stored = await self.storage.get_state(store_key)
-            if stored is not None:
-                setattr(self.state, attr, stored == "1")
+            value = await self.storage.get_state(store_key)
+            if value is not None:
+                setattr(self.state, attr, value == "1")
 
     async def _persist_state(self) -> None:
-        """把运行时状态写入持久化 state 表。"""
-        await self.storage.set_state("rt_target_group_id", self.state.group_id)
-        await self.storage.set_state("rt_target_qq_id", self.state.qq_id)
-        await self.storage.set_state("rt_target_nickname", self.state.nickname)
+        """把目标集合与开关写入持久化 state 表。"""
+        await self.storage.set_state("rt_targets", targets_mod.targets_to_json(self.state.targets))
+        await self.storage.set_state("rt_active_key", self.state.active_key)
         await self.storage.set_state("rt_enabled", "1" if self.state.enabled else "0")
         await self.storage.set_state(
             "rt_listen_enabled", "1" if self.state.listen_enabled else "0"
         )
+        # 兼容旧键：万一需要回退到 v0.1.0，单目标信息还在
+        await self.storage.set_state("rt_target_group_id", self.state.group_id)
+        await self.storage.set_state("rt_target_qq_id", self.state.qq_id)
+        await self.storage.set_state("rt_target_nickname", self.state.nickname)

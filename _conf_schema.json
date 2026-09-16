@@ -5,22 +5,44 @@
     "hint": "关掉它等于让整个插件睡觉，采集和指令都会停。",
     "default": true
   },
-  "target_group_id": {
-    "type": "string",
-    "description": "目标群号",
-    "hint": "要蒸馏谁，就先填他所在的群号；也可以进群用 /zl set 现场设定。",
-    "default": ""
+  "targets": {
+    "type": "template_list",
+    "description": "蒸馏目标清单（可加多个）",
+    "hint": "想蒸馏谁就点下面的按钮加一条：填「群号」+「群友 QQ 号」。同一个群挂两个人、两个群各挂两个人，都直接往下加即可，互不干扰。注：这个可视化清单需要 AstrBot ≥ v4.10.4，老版本请改用下面的「目标清单（文本版）」。",
+    "default": [],
+    "templates": {
+      "target": {
+        "name": "群友目标",
+        "hint": "一个群里的一个群友",
+        "display_item": "nickname",
+        "hide_hint_in_list": true,
+        "items": {
+          "group_id": {
+            "type": "string",
+            "description": "群号",
+            "hint": "TA 所在的 QQ 群号，纯数字。",
+            "default": ""
+          },
+          "qq_id": {
+            "type": "string",
+            "description": "群友 QQ 号",
+            "hint": "被蒸馏的那位群友的 QQ 号，纯数字。",
+            "default": ""
+          },
+          "nickname": {
+            "type": "string",
+            "description": "备注昵称",
+            "hint": "可选。填了会让蒸馏提示词更准，也方便你在列表里认人。",
+            "default": ""
+          }
+        }
+      }
+    }
   },
-  "target_qq_id": {
-    "type": "string",
-    "description": "目标群友 QQ 号",
-    "hint": "被蒸馏的那位群友的 QQ 号，纯数字，别带空格。",
-    "default": ""
-  },
-  "target_nickname": {
-    "type": "string",
-    "description": "目标昵称",
-    "hint": "填了会让提示词更准，留空也行，LLM 大概也能猜。",
+  "targets_text": {
+    "type": "text",
+    "description": "目标清单（文本版，任何版本都能用）",
+    "hint": "一行一个目标，格式：群号 空格 QQ号 空格 备注昵称（昵称可省）。分隔符用空格、逗号、顿号、竖线都行；以 # 开头的行当注释忽略。例：\n987654321 123456789 老王\n987654321 222222222 小李\n555555555 333333333\n\n上面的「蒸馏目标清单」里填过的目标与这里会合并去重，重复填没关系。",
     "default": ""
   },
   "listen_enabled": {
@@ -32,13 +54,13 @@
   "auto_distill": {
     "type": "bool",
     "description": "自动蒸馏",
-    "hint": "攒够语料就自动喊一次 LLM 蒸馏，想省 token 就关掉，改成手动 /zl distill。",
+    "hint": "某个目标的语料攒够了就自动喊一次 LLM 蒸馏。想省 token 就关掉，改成手动 /zl distill。",
     "default": true
   },
   "distill_interval_messages": {
     "type": "int",
     "description": "自动蒸馏触发条数",
-    "hint": "每累计这么多条「未蒸馏」语料就触发一轮蒸馏，默认 200。",
+    "hint": "每个目标各自计数：每累计这么多条「未蒸馏」语料就触发一轮蒸馏，默认 200。",
     "default": 200
   },
   "distill_batch_messages": {
@@ -68,13 +90,14 @@
   "record_context": {
     "type": "bool",
     "description": "记录上下文",
-    "hint": "额外记下目标发言前后各 1 条相邻消息，帮 LLM 理解语境。",
+    "hint": "额外记下目标发言前后各 1 条相邻消息，帮 LLM 理解语境。多目标时上下文会各自归属，不会串台。",
     "default": true
   },
   "llm_provider_id": {
     "type": "string",
-    "description": "指定 LLM Provider ID",
-    "hint": "想指定某个模型供应商就填它的 ID，留空用当前会话默认 Provider。",
+    "description": "蒸馏用的模型",
+    "hint": "点右边的下拉框，从你在 AstrBot 里已经配好的模型里挑一个来干蒸馏这活儿。建议选便宜、长上下文、听指令的模型；留空则用当前会话的默认模型。需 AstrBot ≥ v4.0.0。",
+    "_special": "select_provider",
     "default": ""
   },
   "admin_only": {
@@ -93,6 +116,71 @@
     "type": "text",
     "description": "追加蒸馏约束",
     "hint": "会拼接到蒸馏提示词末尾，比如「多关注他吐槽的语气」，可留空。",
+    "default": ""
+  },
+  "persona_template": {
+    "type": "object",
+    "description": "人格模板（蒸馏结果 → AstrBot 人格设定）",
+    "hint": "蒸馏完成后，把 5 层结论组装成一段可以直接当 AstrBot 人格用的系统提示词。可以手动复制（/zl persona），也可以一键写进 AstrBot 的人格设定（/zl push）。",
+    "default": {},
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用人格模板",
+        "hint": "关掉后 /zl persona 与 /zl push 都会停用。",
+        "default": true
+      },
+      "persona_id_prefix": {
+        "type": "string",
+        "description": "人格 ID 前缀",
+        "hint": "自动生成的人格名形如「前缀-昵称-QQ」，在 AstrBot 的人格列表里靠它区分。默认「群友蒸馏」。",
+        "default": "群友蒸馏"
+      },
+      "auto_write": {
+        "type": "bool",
+        "description": "达标后自动写入 AstrBot 人格",
+        "hint": "打开后，每次蒸馏结束只要档案完整度达到下面的阈值，就自动创建或更新对应的人格，不用你手动敲 /zl push。",
+        "default": false
+      },
+      "auto_write_threshold": {
+        "type": "int",
+        "description": "自动写入的完整度阈值（%）",
+        "hint": "档案完整度 = 5 层里有几层已经攒出结论。默认 80，也就是至少 4 层成型才自动写入。",
+        "default": 80
+      },
+      "include_evidence": {
+        "type": "bool",
+        "description": "人格里附带原话样例",
+        "hint": "打开后会在每条结论后面附上 1~2 条聊天原话。能让模型更快找到语感，但人格文本会变长、也更容易暴露聊天内容，一般建议关着。",
+        "default": false
+      },
+      "extra_rules": {
+        "type": "text",
+        "description": "人格追加规矩",
+        "hint": "你想给这个角色额外加的死规矩，比如「绝对不许发自拍」「每次回答不许超过两句话」。会放在人格模板的最后一段。",
+        "default": ""
+      }
+    }
+  },
+  "target_group_id": {
+    "type": "string",
+    "description": "（旧版遗留）目标群号",
+    "hint": "v0.1.0 的单目标字段，已由「蒸馏目标清单」取代。保留仅为了兼容旧配置，建议清空。",
+    "invisible": true,
+    "default": ""
+  },
+  "target_qq_id": {
+    "type": "string",
+    "description": "（旧版遗留）目标 QQ 号",
+    "hint": "v0.1.0 的单目标字段，已由「蒸馏目标清单」取代。保留仅为了兼容旧配置，建议清空。",
+    "invisible": true,
+    "default": ""
+  },
+  "target_nickname": {
+    "type": "string",
+    "description": "（旧版遗留）目标昵称",
+    "hint": "v0.1.0 的单目标字段，已由「蒸馏目标清单」取代。保留仅为了兼容旧配置，建议清空。",
+    "invisible": true,
     "default": ""
   }
 }

@@ -2,12 +2,15 @@
 
 纯文本渲染，不依赖任何平台富媒体能力（除了调用方自行拼 @ 组件），
 因此本模块零 AstrBot 依赖，可被单元测试直接导入、直接断言输出字符串。
+
+面板分三块：**当前目标详情** → **目标清单**（多目标时才显示）→ **操作提示**。
+只有 1 个目标时输出与 v0.1.0 完全一致，避免单目标用户看到多余的噪音。
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 try:
@@ -20,6 +23,9 @@ BAR_FULL = "█"
 BAR_EMPTY = "░"
 BAR_WIDTH = 10
 SEP = "──────────────────────────"
+
+# 群聊单条消息的安全长度：超过就分条发，避免被平台截断
+CHUNK_LIMIT = 1500
 
 
 def make_bar(current: int, total: int, width: int = BAR_WIDTH) -> str:
@@ -79,6 +85,73 @@ def fmt_span(min_ts: Any, max_ts: Any) -> str:
     return f"{fmt_dt(lo)} ~ {fmt_dt(hi)}（{days} 天）"
 
 
+def chunk_text(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
+    """把长文本按行切成若干块，每块长度尽量不超过 ``limit``。
+
+    优先在换行处切；单行本身就超长时按硬长度截断，保证一定能切开。
+
+    Args:
+        text: 原始文本。
+        limit: 单块长度上限（按字符计）。
+
+    Returns:
+        分块列表；输入为空时返回空列表。
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+    if limit <= 0:
+        return [raw]
+
+    chunks: list[str] = []
+    buf = ""
+    for line in raw.splitlines():
+        while len(line) > limit:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{buf}\n{line}" if buf else line
+        if len(candidate) > limit:
+            chunks.append(buf)
+            buf = line
+        else:
+            buf = candidate
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+@dataclass
+class TargetRow:
+    """目标清单里的一行。"""
+
+    key: str = ""
+    nickname: str = ""
+    qq: str = ""
+    group_id: str = ""
+    total: int = 0
+    undistilled: int = 0
+    round_no: int = 0
+    completeness: int = 0
+    active: bool = False
+    distilling: bool = False
+    has_persona: bool = False
+
+    def render(self) -> str:
+        """渲染成一行文本。"""
+        mark = "▶" if self.active else "·"
+        name = self.nickname or "未知昵称"
+        spin = " 🟠" if self.distilling else ""
+        persona = " · 已有人格" if self.has_persona else ""
+        return (
+            f"{mark} {name}({self.qq})@{self.group_id}{spin}\n"
+            f"   {fmt_int(self.total)} 条 · {self.round_no} 轮 · "
+            f"档案 {self.completeness}% · 待蒸馏 {fmt_int(self.undistilled)}{persona}"
+        )
+
+
 @dataclass
 class PanelData:
     """进度面板的渲染数据。"""
@@ -101,6 +174,7 @@ class PanelData:
     completeness: int = 0
     formed_layers: int = 0
     total_layers: int = len(prompts.LAYER_KEYS)
+    targets: list[TargetRow] = field(default_factory=list)
 
 
 def render_no_target() -> str:
@@ -109,8 +183,8 @@ def render_no_target() -> str:
         f"🧪 群友蒸馏 · {PLUGIN_DISPLAY}",
         SEP,
         "❗ 还没有设定蒸馏目标",
-        "请在 WebUI 插件配置里填写「目标群号 / 目标群友 QQ」，",
-        "或直接在群里用指令：/zl set <群号> <QQ号>",
+        "请在 WebUI 插件配置里添加「蒸馏目标」（可加多个），",
+        "或直接在群里用指令：/zl add <群号> <QQ号>",
         SEP,
         "💡 /zl help 查看全部指令",
     ]
@@ -149,14 +223,46 @@ def render_panel(data: PanelData) -> str:
         f"🔁 蒸馏    {data.round_no} 轮 · 上次 {last} · 排队 {fmt_int(data.queue)} 条待蒸馏",
         f"📅 跨度    {fmt_span(data.min_ts, data.max_ts)}",
         f"🧩 档案    完整度 {data.completeness}% · 已成型 {data.formed_layers}/{data.total_layers} 层",
-        SEP,
-        "💡 /zl profile 看档案 · /zl help 看全部指令",
     ]
+
+    # 多目标时才追加清单，避免单目标用户被多余信息干扰
+    if len(data.targets) > 1:
+        lines.append(SEP)
+        lines.append(f"🎯 目标清单（{len(data.targets)} 个，▶ 为当前）")
+        lines.extend(row.render() for row in data.targets)
+
+    lines.append(SEP)
+    lines.append("💡 /zl list 目标清单 · /zl profile 看档案 · /zl persona 生成人格 · /zl help 全部指令")
+    return "\n".join(lines)
+
+
+def render_target_list(rows: list[TargetRow], active_key: str = "") -> str:
+    """渲染 ``/zl list`` 的目标清单。"""
+    if not rows:
+        return (
+            "📭 还没有任何蒸馏目标。\n"
+            "用 /zl add <群号> <QQ号> [昵称] 添加，\n"
+            "或在 WebUI 插件配置的「蒸馏目标清单」里添加。"
+        )
+
+    lines = [
+        f"🎯 蒸馏目标清单（共 {len(rows)} 个）",
+        SEP,
+    ]
+    for row in rows:
+        row.active = row.active or (bool(active_key) and row.key == active_key)
+        lines.append(row.render())
+    lines.append(SEP)
+    lines.append("💡 /zl use <QQ号> 切换当前目标 · /zl del <QQ号> 删除")
+    lines.append("   同一群可以挂多个群友，多个群也可以各挂几个。")
     return "\n".join(lines)
 
 
 def render_profile(
-    snapshot: Optional[dict[str, Any]], nickname: str, qq: str
+    snapshot: Optional[dict[str, Any]],
+    nickname: str,
+    qq: str,
+    group_id: str = "",
 ) -> str:
     """渲染 ``/zl profile`` 的 5 层档案摘要。"""
     if not isinstance(snapshot, dict):
@@ -171,8 +277,11 @@ def render_profile(
 
     from .distiller import compute_completeness  # 局部导入避免循环
 
+    header = f"🧬 {nickname or '未知昵称'} 的人格档案（{qq}）"
+    if group_id:
+        header += f" @ 群 {group_id}"
     lines = [
-        f"🧬 {nickname or '未知昵称'} 的人格档案（{qq}）",
+        header,
         f"第 {meta.get('distill_round', 0)} 轮 · 完整度 {compute_completeness(snapshot)}% "
         f"· 语料 {fmt_int(meta.get('total_messages', 0))} 条",
         SEP,
@@ -201,7 +310,25 @@ def render_profile(
         lines.append("- （暂无）")
 
     lines.append(SEP)
-    lines.append("💡 /zl export 导出完整 Markdown 档案")
+    lines.append("💡 /zl persona 生成人格模板 · /zl export 导出 Markdown 档案")
+    return "\n".join(lines)
+
+
+def render_persona_header(
+    nickname: str, qq: str, group_id: str, persona_id: str, chunk_count: int
+) -> str:
+    """渲染 ``/zl persona`` 的头部说明，后面跟着人格模板正文。"""
+    lines = [
+        f"🪪 人格模板 · {nickname or '未知昵称'}（{qq}）@ {group_id}",
+        SEP,
+        f"建议人格 ID：{persona_id}",
+        "用法：把下面的内容整段复制，粘到 AstrBot WebUI 的「人格设定」里即可；",
+        "或者直接发 /zl push，让它自动帮你创建/更新人格。",
+        SEP,
+    ]
+    if chunk_count > 1:
+        lines.append(f"（内容较长，已切成 {chunk_count} 条发送，按顺序拼起来用）")
+        lines.append(SEP)
     return "\n".join(lines)
 
 
@@ -211,15 +338,22 @@ def render_help(prefix: str = "/zl") -> str:
     lines = [
         f"🧪 {PLUGIN_DISPLAY} · 指令帮助",
         SEP,
-        f"{p}                查看进度面板",
+        "— 目标管理 —",
+        f"{p} list            查看全部目标及各自进度",
+        f"{p} add <群号> <QQ> [昵称]   添加一个蒸馏目标",
+        f"{p} del <QQ号> [purge]      删除目标（加 purge 连语料档案一起删）",
+        f"{p} use <QQ号>      切换当前目标",
+        "— 采集与蒸馏 —",
+        f"{p}                查看当前目标进度面板",
         f"{p} on / off       开启 / 关闭采集",
-        f"{p} set <群号> <QQ> 设定蒸馏目标（也可只给 QQ，用当前群）",
-        f"{p} now            查看当前目标",
-        f"{p} distill        手动触发一轮蒸馏",
-        f"{p} profile        查看 5 层人格档案摘要",
-        f"{p} export         导出 persona_<QQ>.md 到数据目录",
+        f"{p} distill [all]  手动蒸馏（加 all 则依次蒸馏全部目标）",
+        "— 档案与人格 —",
+        f"{p} profile        查看当前目标的 5 层人格档案",
+        f"{p} persona        生成可粘贴进 AstrBot 的人格模板",
+        f"{p} push           把人格模板直接写进 AstrBot 人格设定",
+        f"{p} export         导出 persona_<QQ>.md 与人格模板到数据目录",
         f"{p} correct <内容>  追加人工纠正（别名：{p} 纠正 <内容>）",
-        f"{p} reset confirm  清空该目标语料（需二次确认）",
+        f"{p} reset confirm  清空当前目标的语料（需二次确认）",
         f"{p} help           显示本帮助",
         SEP,
         "⚠️ 仅供娱乐，请勿用于侵犯他人隐私。",

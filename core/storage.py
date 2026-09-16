@@ -32,19 +32,21 @@ DB_FILENAME = "distiller.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id   TEXT UNIQUE,
-    group_id     TEXT NOT NULL,
-    speaker_qq   TEXT NOT NULL,
-    speaker_name TEXT NOT NULL DEFAULT '',
-    content      TEXT NOT NULL,
-    raw_type     TEXT NOT NULL DEFAULT 'text',
-    timestamp    INTEGER NOT NULL DEFAULT 0,
-    created_at   INTEGER NOT NULL DEFAULT 0,
-    is_context   INTEGER NOT NULL DEFAULT 0,
-    distilled    INTEGER NOT NULL DEFAULT 0
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id      TEXT UNIQUE,
+    group_id        TEXT NOT NULL,
+    speaker_qq      TEXT NOT NULL,
+    speaker_name    TEXT NOT NULL DEFAULT '',
+    content         TEXT NOT NULL,
+    raw_type        TEXT NOT NULL DEFAULT 'text',
+    timestamp       INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL DEFAULT 0,
+    is_context      INTEGER NOT NULL DEFAULT 0,
+    context_for_qq  TEXT NOT NULL DEFAULT '',
+    distilled       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_msg_target   ON messages(group_id, speaker_qq);
+CREATE INDEX IF NOT EXISTS idx_msg_ctx      ON messages(group_id, context_for_qq);
 CREATE INDEX IF NOT EXISTS idx_msg_distilled ON messages(distilled);
 
 CREATE TABLE IF NOT EXISTS persona (
@@ -77,8 +79,21 @@ CREATE TABLE IF NOT EXISTS state (
 class MessageRecord:
     """一条待入库的群聊消息。
 
-    ``is_context`` 为 True 时表示该条是"目标消息的相邻上下文"，
-    用于帮助 LLM 理解语境，不计入目标语料统计。
+    Attributes:
+        message_id: 平台消息 ID，用于去重。
+        group_id: 所在群号。
+        speaker_qq: 发言人 QQ。
+        speaker_name: 发言人昵称。
+        content: 消息文本（非文本消息已被转成 ``[图片]`` 之类的占位符）。
+        raw_type: 原始消息类型标记，保留给后续扩展。
+        timestamp: 消息时间戳（秒）。
+        created_at: 入库时间戳（秒）。
+        is_context: True 表示这是「目标消息的相邻上下文」，不计入目标语料统计。
+        context_for_qq: 该上下文属于哪个目标（仅 ``is_context=True`` 时有意义）。
+
+            多目标场景下这是**必需**的：同一个群里若有两位蒸馏目标，
+            上下文行必须归属到具体目标，否则 A 目标蒸馏时会混进 B 目标旁边
+            的闲聊，污染人格判断。
     """
 
     message_id: str
@@ -90,6 +105,7 @@ class MessageRecord:
     timestamp: int = 0
     created_at: int = 0
     is_context: bool = False
+    context_for_qq: str = ""
 
 
 # 第三级兜底（写入插件目录内）的告警只触发一次，避免每次调用都刷屏
@@ -193,9 +209,41 @@ class Storage:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
+        # 先补列再建索引：老库若缺 context_for_qq，_SCHEMA 里的建索引语句会直接报错
+        self._migrate_sync(conn)
         conn.executescript(_SCHEMA)
         conn.commit()
         self._conn = conn
+
+    @staticmethod
+    def _migrate_sync(conn: sqlite3.Connection) -> None:
+        """表结构迁移（幂等）。
+
+        目前只有一条：v0.1.0 → v0.2.0 给 ``messages`` 补 ``context_for_qq`` 列。
+        老库里已有的上下文行该列为空串，取语料时会被当成「属于该群任意目标」，
+        退化成单目标时的行为，不会丢数据。
+        """
+        try:
+            rows = conn.execute("PRAGMA table_info(messages)").fetchall()
+        except sqlite3.Error as exc:  # pragma: no cover - 极端异常
+            logger.error("[%s] 读取表结构失败: %s", PLUGIN_NAME, exc)
+            return
+        if not rows:
+            return  # 全新库，_SCHEMA 会直接建出完整结构
+        cols = {str(row["name"]) for row in rows}
+        if "context_for_qq" not in cols:
+            try:
+                conn.execute(
+                    "ALTER TABLE messages "
+                    "ADD COLUMN context_for_qq TEXT NOT NULL DEFAULT ''"
+                )
+                conn.commit()
+                logger.info(
+                    "[%s] 数据库已升级：messages 表新增 context_for_qq 列（v0.2.0）。",
+                    PLUGIN_NAME,
+                )
+            except sqlite3.Error as exc:  # pragma: no cover - 磁盘/权限异常
+                logger.error("[%s] 升级表结构失败: %s", PLUGIN_NAME, exc)
 
     async def close(self) -> None:
         """提交并关闭连接（幂等）。"""
@@ -240,8 +288,8 @@ class Storage:
                 """
                 INSERT OR IGNORE INTO messages
                     (message_id, group_id, speaker_qq, speaker_name, content,
-                     raw_type, timestamp, created_at, is_context)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     raw_type, timestamp, created_at, is_context, context_for_qq)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.message_id,
@@ -253,6 +301,7 @@ class Storage:
                     int(record.timestamp or 0),
                     int(record.created_at or time.time()),
                     1 if record.is_context else 0,
+                    record.context_for_qq if record.is_context else "",
                 ),
             )
             self._conn.commit()
@@ -317,14 +366,20 @@ class Storage:
             cur = self._conn.execute(
                 """
                 SELECT id, message_id, speaker_qq, speaker_name, content,
-                       timestamp, is_context
+                       timestamp, is_context, context_for_qq
                 FROM messages
                 WHERE group_id = ? AND distilled = 0
-                      AND (speaker_qq = ? OR is_context = 1)
+                      AND (
+                            speaker_qq = ?
+                            OR (
+                                is_context = 1
+                                AND (context_for_qq = '' OR context_for_qq = ?)
+                            )
+                          )
                 ORDER BY timestamp ASC, id ASC
                 LIMIT ?
                 """,
-                (group_id, qq, max(1, int(limit))),
+                (group_id, qq, qq, max(1, int(limit))),
             )
             return [dict(row) for row in cur.fetchall()]
         except sqlite3.Error as exc:
@@ -383,9 +438,16 @@ class Storage:
             cur = self._conn.execute(
                 """
                 DELETE FROM messages
-                WHERE group_id = ? AND (speaker_qq = ? OR is_context = 1)
+                WHERE group_id = ?
+                      AND (
+                            speaker_qq = ?
+                            OR (
+                                is_context = 1
+                                AND (context_for_qq = '' OR context_for_qq = ?)
+                            )
+                          )
                 """,
-                (group_id, qq),
+                (group_id, qq, qq),
             )
             self._conn.commit()
             return cur.rowcount
@@ -450,6 +512,28 @@ class Storage:
             return True
         except (sqlite3.Error, TypeError, ValueError) as exc:
             logger.error("[%s] 保存 Persona 失败: %s", PLUGIN_NAME, exc)
+            return False
+
+    async def delete_persona(self, group_id: str, qq: str) -> bool:
+        """删除某目标的 Persona 快照及其纠正层（用于 ``/zl del <QQ> purge``）。"""
+        return await self._run(self._delete_persona_sync, group_id, qq)
+
+    def _delete_persona_sync(self, group_id: str, qq: str) -> bool:
+        if self._conn is None:
+            return False
+        try:
+            self._conn.execute(
+                "DELETE FROM persona WHERE group_id = ? AND target_qq = ?",
+                (group_id, qq),
+            )
+            self._conn.execute(
+                "DELETE FROM corrections WHERE group_id = ? AND target_qq = ?",
+                (group_id, qq),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            logger.error("[%s] 删除 Persona 失败: %s", PLUGIN_NAME, exc)
             return False
 
     # ------------------------------------------------------------------ #

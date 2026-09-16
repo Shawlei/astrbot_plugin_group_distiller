@@ -32,10 +32,12 @@ try:
     from . import prompts
     from .collector import RuntimeState
     from .storage import Storage
+    from .targets import TargetSpec
 except ImportError:  # pragma: no cover - 兼容顶层导入
     import prompts  # type: ignore
     from collector import RuntimeState  # type: ignore
     from storage import Storage  # type: ignore
+    from targets import TargetSpec  # type: ignore
 
 PLUGIN_NAME = "astrbot_plugin_group_distiller"
 
@@ -325,6 +327,21 @@ class Distiller:
         self._running = False
         self._task: Optional[asyncio.Task[None]] = None
         self._lock = asyncio.Lock()
+        # 当前正在处理的目标；由 _run 在逐个目标时写入，_distill_once 读取
+        self._current: Optional[TargetSpec] = None
+        # 单轮蒸馏成功后的回调（由 main 注入，用于「蒸馏达标自动写入人格」）
+        self._on_distilled: Optional[Any] = None
+
+    def set_on_distilled(self, callback: Optional[Any]) -> None:
+        """注册蒸馏成功回调：``await callback(target, snapshot)``。
+
+        回调异常会被吞掉并记日志，绝不影响蒸馏主流程。
+        """
+        self._on_distilled = callback
+
+    def current_target(self) -> Optional[TargetSpec]:
+        """当前正在蒸馏的目标（空闲时为 None）。"""
+        return self._current
 
     # ------------------------------------------------------------------ #
     # 触发
@@ -336,62 +353,139 @@ class Distiller:
             return True
         return self._task is not None and not self._task.done()
 
+    def _pick_auto_candidate(self) -> Optional[TargetSpec]:
+        """挑一个"最欠蒸馏"的目标（未蒸馏语料最多）。
+
+        只看内存计数，保证在每条群消息的热路径上是 O(目标数) 而非查库。
+        """
+        interval = max(
+            1, self._safe_int(self.config.get("distill_interval_messages", 200), 200)
+        )
+        best: Optional[TargetSpec] = None
+        best_count = 0
+        for spec in self.state.collect_targets():
+            count = int(self.state.counts_for(spec).get("undistilled", 0))
+            if count >= interval and count > best_count:
+                best, best_count = spec, count
+        return best
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        """把任意配置值安全转换为 int。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     async def maybe_auto(self, umo: str) -> None:
-        """自动蒸馏检查：攒够语料且开启自动蒸馏时触发一轮。"""
+        """自动蒸馏检查：某个目标的语料攒够了就触发一轮。"""
         try:
             if not bool(self.config.get("auto_distill", True)):
                 return
-            if self.is_running() or not self.state.has_target():
+            if self.is_running():
                 return
-            interval = max(1, int(self.config.get("distill_interval_messages", 200) or 200))
-            if self.state.undistilled < interval:
+            spec = self._pick_auto_candidate()
+            if spec is None:
                 return
-            await self.trigger(umo, manual=False)
+            await self.trigger(umo, manual=False, target=spec)
         except Exception as exc:  # noqa: BLE001 - 自动路径必须兜底
             logger.error("[%s] 自动蒸馏检查异常: %s", self.plugin_name, exc)
 
-    async def trigger(self, umo: str, manual: bool = False) -> DistillResult:
-        """触发一轮蒸馏（异步后台执行，立即返回）。
+    async def trigger(
+        self,
+        umo: str,
+        manual: bool = False,
+        target: Optional[TargetSpec] = None,
+        all_targets: bool = False,
+    ) -> DistillResult:
+        """触发蒸馏（异步后台执行，立即返回）。
 
         Args:
             umo: 会话来源（``unified_msg_origin``），用于选 Provider 与发消息。
-            manual: 是否为手动触发。
+            manual: 是否为手动触发（只影响返回文案）。
+            target: 指定要蒸馏的目标；为 None 时用当前选中目标。
+            all_targets: 为 True 时依次蒸馏全部目标（此时忽略 ``target``）。
 
         Returns:
             :class:`DistillResult`，告诉调用方是否成功排队。
         """
         if self.is_running():
             return DistillResult(False, "⏳ 已有一轮蒸馏正在进行，请稍候再试。")
-        if not self.state.has_target():
-            return DistillResult(False, "⚠️ 还没有设定蒸馏目标，先用 /zl set 或 WebUI 配置。")
-        self._task = asyncio.create_task(self._run(umo))
+
+        if all_targets:
+            queue = self.state.collect_targets()
+            if not queue:
+                return DistillResult(False, "⚠️ 还没有设定蒸馏目标，先用 /zl add 或 WebUI 配置。")
+        else:
+            if target is None:
+                target = self.state.active_target()
+            if target is None:
+                return DistillResult(False, "⚠️ 还没有设定蒸馏目标，先用 /zl add 或 WebUI 配置。")
+            queue = [target]
+
+        self._task = asyncio.create_task(self._run(umo, queue))
+        if all_targets:
+            return DistillResult(
+                True, f"🔬 已开始蒸馏全部 {len(queue)} 个目标，完成后可用 /zl list 查看进度。"
+            )
         if manual:
-            return DistillResult(True, "🔬 已开始手动蒸馏，完成后可用 /zl 查看进度。")
-        return DistillResult(True, "🔬 已达到阈值，自动蒸馏已开始。")
+            return DistillResult(
+                True,
+                f"🔬 已开始手动蒸馏：{queue[0].label()}，完成后可用 /zl 查看进度。",
+            )
+        return DistillResult(
+            True, f"🔬 {queue[0].label()} 已达到阈值，自动蒸馏已开始。"
+        )
 
     # ------------------------------------------------------------------ #
     # 主流程
     # ------------------------------------------------------------------ #
 
-    async def _run(self, umo: str) -> None:
-        """执行一轮完整蒸馏（内部方法，异常全部兜底）。"""
+    async def _run(self, umo: str, targets: Optional[list[TargetSpec]] = None) -> None:
+        """执行一轮（可含多个目标）蒸馏（内部方法，异常全部兜底）。"""
+        queue = targets if targets else None
+        if queue is None:
+            active = self.state.active_target()
+            queue = [active] if active is not None else []
+
         async with self._lock:
             self._running = True
             try:
-                await self._distill_once(umo)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("[%s] 蒸馏失败: %s", self.plugin_name, exc, exc_info=True)
+                for spec in queue:
+                    self._current = spec
+                    try:
+                        await self._distill_once(umo)
+                    except Exception as exc:  # noqa: BLE001 - 单个目标失败不影响其它目标
+                        logger.error(
+                            "[%s] 目标 %s 蒸馏失败: %s",
+                            self.plugin_name,
+                            spec.label(),
+                            exc,
+                            exc_info=True,
+                        )
             finally:
                 self._running = False
+                self._current = None
 
-    async def _distill_once(self, umo: str) -> None:
-        group_id = self.state.group_id
-        qq = self.state.qq_id
-        batch_limit = max(1, int(self.config.get("distill_batch_messages", 300) or 300))
+    async def _distill_once(self, umo: str, target: Optional[TargetSpec] = None) -> None:
+        """对单个目标执行一轮蒸馏。
+
+        Args:
+            umo: 会话来源。
+            target: 目标；为 None 时依次回退到「当前正在处理的目标」→「选中目标」。
+        """
+        spec = target or self._current or self.state.active_target()
+        if spec is None:
+            logger.info("[%s] 无目标可蒸馏，跳过。", self.plugin_name)
+            return
+
+        group_id = spec.group_id
+        qq = spec.qq_id
+        batch_limit = max(1, self._safe_int(self.config.get("distill_batch_messages", 300), 300))
 
         records = await self.storage.fetch_undistilled(group_id, qq, batch_limit)
         if not records:
-            logger.info("[%s] 无待蒸馏语料，跳过本轮。", self.plugin_name)
+            logger.info("[%s] %s 无待蒸馏语料，跳过本轮。", self.plugin_name, spec.label())
             return
 
         existing = await self.storage.get_persona(group_id, qq)
@@ -402,7 +496,7 @@ class Distiller:
 
         extra = str(self.config.get("custom_prompt_extra", "") or "")
         user_prompt = prompts.build_analyzer_user(
-            nickname=self.state.nickname,
+            nickname=spec.nickname,
             qq=qq,
             records=records,
             existing_snapshot=existing,
@@ -412,11 +506,14 @@ class Distiller:
         text = await self._chat(provider, prompts.ANALYZER_SYSTEM, user_prompt)
         analysis = parse_analysis(text)
         if analysis is None:
-            logger.error("[%s] LLM 返回无法解析为 JSON，本轮中止（语料保持未蒸馏）。", self.plugin_name)
+            logger.error(
+                "[%s] LLM 返回无法解析为 JSON，本轮中止（语料保持未蒸馏）。", self.plugin_name
+            )
             return
 
         corrections = await self.storage.get_corrections(group_id, qq)
         total = await self.storage.count_messages(group_id, qq)
+        undistilled = await self.storage.count_undistilled(group_id, qq)
         span_lo, span_hi = await self.storage.get_time_span(group_id, qq)
         merged = merge_snapshot(
             existing,
@@ -427,19 +524,31 @@ class Distiller:
                 "deduped_messages": total,
                 "span_start": span_lo,
                 "span_end": span_hi,
+                "group_id": group_id,
+                "target_qq": qq,
+                "nickname": spec.nickname,
             },
         )
 
         await self.storage.save_persona(group_id, qq, merged)
         await self.storage.mark_distilled([int(r["id"]) for r in records])
-        self.state.undistilled = await self.storage.count_undistilled(group_id, qq)
+        # 用数据库的真实统计刷新计数缓存（round 后 undistilled 已归零一批）
+        self.state.set_counts(spec.key, total, undistilled)
         logger.info(
-            "[%s] 蒸馏完成：本轮 %d 条，轮次 %d，剩余未蒸馏 %d 条。",
+            "[%s] %s 蒸馏完成：本轮 %d 条，轮次 %d，剩余未蒸馏 %d 条。",
             self.plugin_name,
+            spec.label(),
             len(records),
             merged["meta"].get("distill_round", 0),
-            self.state.undistilled,
+            undistilled,
         )
+
+        # 通知外部（例如「达到完整度阈值就写入 AstrBot 人格」）
+        if self._on_distilled is not None:
+            try:
+                await self._on_distilled(spec, merged)
+            except Exception as exc:  # noqa: BLE001 - 回调失败不影响蒸馏结果
+                logger.error("[%s] 蒸馏回调执行失败: %s", self.plugin_name, exc)
 
     # ------------------------------------------------------------------ #
     # LLM 交互
