@@ -54,6 +54,14 @@ from .schedule import (
     format_hhmm,
     parse_hhmm,
 )
+from .prompts import (
+    DEFAULT_PERSONA_TEMPLATE_KEY,
+    PERSONA_TEMPLATES,
+    PERSONA_TOKEN_DOC,
+    build_persona_context,
+    render_persona_template,
+    resolve_persona_template,
+)
 from .targets import (
     TargetSpec,
     collect_config_targets,
@@ -107,6 +115,13 @@ __all__ = [
     "format_hhmm",
     "day_start_ts",
     "date_str",
+    # 人设模板
+    "PERSONA_TEMPLATES",
+    "DEFAULT_PERSONA_TEMPLATE_KEY",
+    "PERSONA_TOKEN_DOC",
+    "resolve_persona_template",
+    "render_persona_template",
+    "build_persona_context",
     # 进度渲染
     "PanelData",
     "TargetRow",

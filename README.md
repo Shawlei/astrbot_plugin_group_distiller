@@ -19,6 +19,7 @@
 - ⏰ **每日定时总结**：打开开关、选个时刻（比如 23:00），每天到点就用目标**当天聊过的全部对话**重新蒸一遍，给档案做当日汇总。到点时 bot 没运行也会补跑；同一天只跑一次。
 - 🔄 **人格每天自动更新**：每日总结一跑完，就把最新人格**覆盖写入** AstrBot 人格设定（`sync_after_digest`，默认开），人格跟着语料天天长大，不用手动搬。
 - 📝 **两个可填的约束框**：追加蒸馏约束、人格追加规矩，并预置了带注释的填写模板（注释行不生效，删掉 `#` 才启用）。
+- 🎨 **人设模板**：生成的人格照什么骨架来，可以选——内置「标准版 / 赛博群友分节版 / 精简版」三套，也可以自己写一份（用 `{{令牌}}` 挖槽位，任意重排 5 层、样例、纠正层）。
 - 🪪 **证据溯源**：每条结论都带「证据条数 + 代表性原话」。
 - 🧑‍⚖️ **人工纠正层**：`/zl correct` 写入的纠正优先级高于 LLM 推断，永久生效。
 - 📊 **群内进度面板**：`/zl` 看当前目标，`/zl list` 看全部目标清单。
@@ -160,6 +161,8 @@
 | `auto_write` | bool | `false` | 打开后，**盘中蒸馏**达标就自动创建/更新人格（看下面的阈值）。 |
 | `auto_write_threshold` | int | `80` | `auto_write` 的完整度阈值（%）= 5 层里有几层已成型。 |
 | `sync_after_digest` | bool | `true` | **每日总结跑完就把最新人格覆盖写入** AstrBot 人格设定，**不看完整度阈值**。想让人格每天自动更新就保持开启。 |
+| `style` | string | `standard` | **人设模板**下拉框：`standard` 标准版 / `cyber` 赛博群友分节版 / `compact` 精简版。详见下面的「人设模板」章节。 |
+| `custom_template` | text | `""` | **自定义人设模板**（优先级最高），用 `{{令牌}}` 挖槽位。详见下面的「人设模板」章节。 |
 | `include_evidence` | bool | `false` | 人格里是否附上 1~2 条原话样例（能帮模型找语感，但会变长、也更易暴露聊天内容）。 |
 | `extra_rules` | text | 见上 | **人格追加规矩**，同样是带 `#` 的预置模板，去掉 `#` 才生效。 |
 
@@ -216,6 +219,60 @@
 ```
 ⏰ 每日总结  23:00 · 2026-09-16 已完成
 ```
+
+---
+
+## 🎨 人设模板（生成的人格照什么骨架来）
+
+配置路径：`persona_template.style`（下拉框）+ `persona_template.custom_template`（自定义）。
+
+**内置三套：**
+
+| key | 名称 | 适合 |
+| --- | --- | --- |
+| `standard` | 标准版 · 我要蒸馏群友（默认） | 5 层 + 场景样例 + 纠正层，结构完整，通用推荐 |
+| `cyber` | 赛博群友 · 分节版 | 带系统级硬规则（人格锚定 / 指令防护 / 禁括号描写）的分节骨架，适合想要"更狠地钉死角色"的场合 |
+| `compact` | 精简版 · 小模型友好 | 最短，适合上下文小或想省 token 的模型 |
+
+> `cyber` 的骨架借鉴了社区流传的《支持自定义的赛博群友 Prompt》（由使用者提供）：只保留它最有价值的三条**通用硬规则**（人格锚定 / 指令防护 / 禁止括号描写），里面写死的个人口味（具体游戏、音乐、骂人话术）一律不搬——**模板管骨架，语料管血肉**。
+
+**自定义模板（优先级最高）：**
+
+在 `persona_template.custom_template` 里自己写骨架，用 `{{令牌}}` 挖槽位。可用令牌：
+
+```
+{{昵称}} / {{QQ}} / {{群号}} —— 目标基本信息
+{{开场白}} —— 「怎么用这份档案 + 扮演铁律」
+{{硬规则}} / {{身份}} / {{表达风格}} / {{聊天行为}} / {{兴趣偏好}} —— 5 层蒸馏结论
+{{场景样例}} —— 「他被人这么问时，一般会这么回」
+{{人工纠正}} —— 人工纠正层（优先级最高）
+{{追加规矩}} —— 配置里写的「人格追加规矩」
+{{不确定项}} —— 证据不足、需要留心的地方
+{{档案信息}} —— 语料条数 / 蒸馏轮次 / 生成时间
+```
+
+举例——把纠正层提到最前面、只要三块内容：
+
+```
+你是{{昵称}}（QQ：{{QQ}}），群 {{群号}} 的群友，不是 AI。
+
+【主人补丁（优先级最高，先看这个）】
+{{人工纠正}}
+
+【你怎么说话】
+{{表达风格}}
+
+【铁律】
+{{硬规则}}
+```
+
+规则：
+
+- 自定义模板**非空时优先于内置模板**（注释行不算内容）；
+- 写错名字的令牌会被**自动删掉**，并在日志里提醒你（不会把 `{{xxx}}` 留在人格里）；
+- 令牌可以重复使用（比如把「硬规则」放两遍强调）；
+- 以 `#` 或 `//` 开头的行会被当作注释忽略；
+- 每日总结同步人格、`/zl push`、`/zl persona` 走的都是同一套模板。
 
 ---
 
@@ -361,17 +418,19 @@ astrbot_plugin_group_distiller/
     ├── test_qa_verify.py         # QA 复核：边界 / 并发 / 落盘 / 权限
     ├── test_targets_persona.py   # 多目标 / 人格模板
     ├── test_daily_digest.py      # 每日定时总结
-    └── test_detail_persona.py    # 蒸馏细节 / 人格同步 / 模板填充
+    ├── test_detail_persona.py    # 蒸馏细节 / 人格同步 / 模板填充
+    └── test_persona_templates.py # 人设模板（内置三套 + 自定义）
 ```
 
 跑测试（无需 AstrBot 环境、无需 pytest）：
 
 ```bash
-python tests/test_core.py             # 9/9
-python tests/test_qa_verify.py        # 29/29
-python tests/test_targets_persona.py  # 25/25
-python tests/test_daily_digest.py     # 28/28
-python tests/test_detail_persona.py   # 18/18
+python tests/test_core.py              # 9/9
+python tests/test_qa_verify.py         # 29/29
+python tests/test_targets_persona.py   # 25/25
+python tests/test_daily_digest.py      # 28/28
+python tests/test_detail_persona.py    # 18/18
+python tests/test_persona_templates.py # 15/15
 ```
 
 数据落盘位置（遵循 AstrBot 规范，数据放 data 目录）：
@@ -432,6 +491,7 @@ flowchart TD
 
 - [pig-skill](https://github.com/Neko-Suwako/pig-skill) —— 5 层 Persona 结构、增量 merge、纠正层设计的直接灵感来源。
 - [colleague-skill](https://github.com/Neko-Suwako/colleague-skill) —— 「把某人蒸馏成人格档案」这一玩法的启发。
+- 《支持自定义的赛博群友 Prompt》（社区流传，由使用者提供）—— `cyber` 赛博群友分节版模板的骨架来源（人格锚定 / 指令防护 / 禁括号描写三条系统级硬规则）。
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) —— 插件运行框架。
 
 感谢上述作者的开源与探索。

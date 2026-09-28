@@ -461,7 +461,8 @@ class GroupDistillerPlugin(Star):
 
         yield self._reply(
             event,
-            prompts.build_persona_summary(snapshot, active.display_name, active.qq_id),
+            prompts.build_persona_summary(snapshot, active.display_name, active.qq_id)
+            + f"\n\n🧩 人设模板：{self._persona_template_source()}",
         )
         yield self._reply(
             event,
@@ -852,9 +853,19 @@ class GroupDistillerPlugin(Star):
                 raw.get("auto_write_threshold", 80), 80
             ),
             "sync_after_digest": bool(raw.get("sync_after_digest", True)),
+            "style": str(raw.get("style", "") or ""),
+            "custom_template": str(raw.get("custom_template", "") or ""),
             "include_evidence": bool(raw.get("include_evidence", False)),
             "extra_rules": str(raw.get("extra_rules", "") or ""),
         }
+
+    def _persona_template_source(self) -> str:
+        """当前会用哪份人设模板（供 /zl persona 展示与排查）。"""
+        cfg = self._persona_cfg()
+        _body, source = prompts.resolve_persona_template(
+            cfg["style"], prompts.strip_template_comments(cfg["custom_template"])
+        )
+        return source
 
     def _persona_id(self, spec: TargetSpec) -> str:
         """算出该目标对应的人格 ID。"""
@@ -865,7 +876,7 @@ class GroupDistillerPlugin(Star):
     def _build_persona_text(
         self, spec: TargetSpec, snapshot: Optional[dict[str, Any]]
     ) -> str:
-        """生成可粘贴 / 可写入 AstrBot 的人格模板文本。"""
+        """生成可粘贴 / 可写入 AstrBot 的人格模板文本（照着选定的人设模板来）。"""
         cfg = self._persona_cfg()
         return prompts.build_astrbot_persona(
             snapshot,
@@ -875,6 +886,10 @@ class GroupDistillerPlugin(Star):
             # 追加规矩默认给的是带 # 的模板，用户启用后才真正生效
             extra_rules=prompts.strip_template_comments(cfg["extra_rules"]),
             plugin_name=PLUGIN_DISPLAY,
+            template_key=cfg["style"],
+            # 自定义模板非空时优先于内置模板；同样是带 # 的模板，先剥注释
+            custom_template=prompts.strip_template_comments(cfg["custom_template"]),
+            group_id=spec.group_id,
         )
 
     async def _sync_persona_after_digest(self, items: list[Any]) -> int:
