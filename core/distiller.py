@@ -688,7 +688,6 @@ class Distiller:
 
         corrections = await self.storage.get_corrections(group_id, qq)
         total = await self.storage.count_messages(group_id, qq)
-        undistilled = await self.storage.count_undistilled(group_id, qq)
         span_lo, span_hi = await self.storage.get_time_span(group_id, qq)
         merged = merge_snapshot(
             existing,
@@ -707,7 +706,8 @@ class Distiller:
 
         await self.storage.save_persona(group_id, qq, merged)
         await self.storage.mark_distilled([int(r["id"]) for r in records])
-        # 用数据库的真实统计刷新计数缓存（本轮之后 undistilled 已归零一批）
+        # mark 之后重新读真实剩余量，避免沿用 mark 前的旧计数缓存
+        undistilled = await self.storage.count_undistilled(group_id, qq)
         self.state.set_counts(spec.key, total, undistilled)
 
         round_no = int(merged["meta"].get("distill_round", 0) or 0)

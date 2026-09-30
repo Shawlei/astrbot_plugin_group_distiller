@@ -5,7 +5,7 @@
 AstrBot 的「人格设定」。
 
 作者：Shawlei
-版本：v0.6.0
+版本：v0.7.0
 仓库：https://github.com/Shawlei/astrbot_plugin_group_distiller
 """
 
@@ -56,10 +56,23 @@ except ImportError:  # pragma: no cover
 
 PLUGIN_NAME = "astrbot_plugin_group_distiller"
 PLUGIN_DISPLAY = "我要蒸馏群友"
-PLUGIN_VERSION = "v0.6.0"
+PLUGIN_VERSION = "v0.7.0"
 
 # 可能出现在 message_str 开头的指令前缀（AstrBot 有时会剥离，有时不会）
 _PREFIXES = ("/zl", "zl", "／zl", "/蒸馏", "蒸馏", "／蒸馏")
+
+# 「查用户」独立触发词可能出现在 message_str 开头的各种前缀
+_FIND_PREFIXES = (
+    "/查用户",
+    "查用户",
+    "／查用户",
+    "/查群友",
+    "查群友",
+    "／查群友",
+    "/查询用户",
+    "查询用户",
+    "／查询用户",
+)
 
 # 目标管理的子命令别名
 _HEADS_LIST = ("list", "ls", "列表", "目标", "清单")
@@ -68,6 +81,7 @@ _HEADS_DEL = ("del", "delete", "remove", "rm", "删", "删除")
 _HEADS_USE = ("use", "switch", "切换", "选中")
 _HEADS_PERSONA = ("persona", "人格", "模板", "人格模板")
 _HEADS_PUSH = ("push", "写入", "应用", "装进人格")
+_HEADS_FIND = ("查", "find", "找", "查用户")
 
 
 def _parse_command(raw: str) -> tuple[str, str]:
@@ -101,6 +115,21 @@ def _parse_command(raw: str) -> tuple[str, str]:
     head = parts[0].strip().lower()
     rest = parts[1].strip() if len(parts) > 1 else ""
     return head, rest
+
+
+def _strip_find_prefix(raw: str) -> str:
+    """剥离「查用户」独立触发词的前缀，兼容 AstrBot 是否剥离前缀。
+
+    两种形态都要正确得到 query：``"/查用户 深渊之水"`` → ``"深渊之水"``；
+    ``"深渊之水"``（前缀已被 AstrBot 剥掉）→ ``"深渊之水"``。
+    """
+    text = (raw or "").strip()
+    for prefix in _FIND_PREFIXES:
+        if text == prefix:
+            return ""
+        if text.startswith(prefix + " ") or text.startswith(prefix + "\u3000"):
+            return text[len(prefix) :].strip()
+    return text
 
 
 async def _write_text(path: Path, text: str) -> None:
@@ -291,6 +320,10 @@ class GroupDistillerPlugin(Star):
                     ),
                 )
 
+            elif head in _HEADS_FIND:
+                async for reply in self._handle_find(event, rest, group_id):
+                    yield reply
+
             elif head in _HEADS_PERSONA:
                 async for reply in self._handle_persona(event, group_id):
                     yield reply
@@ -322,6 +355,18 @@ class GroupDistillerPlugin(Star):
             logger.error("[%s] 指令处理异常: %s", PLUGIN_NAME, exc, exc_info=True)
             yield event.plain_result("😵 指令处理出错，请查看后台日志。")
 
+    @filter.command("查用户", alias={"查群友", "查询用户"})
+    async def chayonghu(self, event: AstrMessageEvent):
+        """``/查用户 <昵称或QQ>`` 独立触发词：按昵称/QQ 查某人档案。"""
+        if bool(self.config.get("admin_only", True)) and not self._is_admin(event):
+            yield event.plain_result("🔒 该指令仅管理员可用。")
+            return
+
+        group_id = str(event.get_group_id() or "")
+        query = _strip_find_prefix(getattr(event, "message_str", "") or "")
+        async for reply in self._handle_find(event, query, group_id):
+            yield reply
+
     # ------------------------------------------------------------------ #
     # 目标管理子命令
     # ------------------------------------------------------------------ #
@@ -342,14 +387,29 @@ class GroupDistillerPlugin(Star):
     def _split_target_args(rest: str, event: AstrMessageEvent) -> tuple[str, str, str]:
         """把 ``rest`` 解析成 ``(群号, QQ号, 昵称)``。
 
-        支持 ``<群号> <QQ号> [昵称]`` 与 ``<QQ号> [昵称]``（用当前群）两种写法。
-        昵称允许带空格，因此第三段取剩余整串。
+        支持三种写法：
+
+        - ``<群号> <QQ号> [昵称]``：第二段是纯数字；
+        - ``<QQ号> <昵称>``：第二段是非 ASCII 的昵称（如中文），用当前群；
+        - ``<QQ号>``：只有一段，用当前群。
+
+        第二段是纯 ASCII 的非数字 token（例如把 QQ 打成 ``abc``）时，仍按
+        ``<群号> <QQ号>`` 解析并交给 ``_validate_ids`` 报「QQ 号必须是纯数字」，
+        避免把打错的 QQ 当成昵称悄悄建错目标。昵称允许带空格，第三段取剩余整串。
         """
         parts = rest.split(maxsplit=2)
         if not parts:
             return "", "", ""
         if len(parts) == 1:
             return str(event.get_group_id() or ""), parts[0], ""
+        if parts[1].isdigit():
+            nickname = parts[2] if len(parts) > 2 else ""
+            return parts[0], parts[1], nickname
+        # 非数字且含非 ASCII 字符 → 视为「QQ 昵称」简写（当前群）
+        if not parts[1].isascii():
+            nickname = " ".join(parts[1:]).strip()
+            return str(event.get_group_id() or ""), parts[0], nickname
+        # 纯 ASCII 非数字 → 更可能是打错的 QQ，仍按「群号 QQ号」解析
         nickname = parts[2] if len(parts) > 2 else ""
         return parts[0], parts[1], nickname
 
@@ -369,7 +429,13 @@ class GroupDistillerPlugin(Star):
             yield self._reply(event, error)
             return
 
-        spec = TargetSpec(group_id=group_id, qq_id=qq, nickname=nickname)
+        spec = targets_mod.make_target(group_id, qq, nickname)
+        if spec is None:
+            yield self._reply(
+                event,
+                self._validate_ids(group_id, qq) or "⚠️ 群号/QQ 号不合法（须为 5~20 位纯数字）。",
+            )
+            return
         self.state.clear_targets()
         self.state.add_target(spec)
         self.state.set_active(spec.key)
@@ -400,7 +466,13 @@ class GroupDistillerPlugin(Star):
             yield self._reply(event, error)
             return
 
-        spec = TargetSpec(group_id=group_id, qq_id=qq, nickname=nickname)
+        spec = targets_mod.make_target(group_id, qq, nickname)
+        if spec is None:
+            yield self._reply(
+                event,
+                self._validate_ids(group_id, qq) or "⚠️ 群号/QQ 号不合法（须为 5~20 位纯数字）。",
+            )
+            return
         existed = any(t.key == spec.key for t in self.state.targets)
         self.state.add_target(spec)
         if not existed:
@@ -422,7 +494,7 @@ class GroupDistillerPlugin(Star):
             yield self._reply(event, "用法：/zl del <QQ号> [purge]")
             return
 
-        qq = parts[0]
+        raw_qq = parts[0]
         purge = len(parts) > 1 and parts[1].lower() in (
             "purge",
             "彻底",
@@ -430,9 +502,10 @@ class GroupDistillerPlugin(Star):
             "全部",
             "清空",
         )
-        if not targets_mod.is_valid_id(qq):
+        if not targets_mod.is_valid_id(raw_qq):
             yield self._reply(event, "⚠️ QQ 号必须是纯数字（5~20 位）。")
             return
+        qq = targets_mod._clean_id(raw_qq)
 
         scope = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
         doomed = [t for t in scope if t.qq_id == qq]
@@ -466,6 +539,10 @@ class GroupDistillerPlugin(Star):
         if not key:
             yield self._reply(event, "用法：/zl use <QQ号>")
             return
+        # 清洗噪声 QQ（如 @123、群号:123），但保留「群号:QQ」完整键的原样匹配
+        cleaned = targets_mod._clean_id(key)
+        if cleaned:
+            key = cleaned
         ok = self.state.set_active_in_group(key, group_id) if group_id else self.state.set_active(key)
         if not ok:
             if group_id and self.state.collect_targets():
@@ -484,6 +561,9 @@ class GroupDistillerPlugin(Star):
 
     async def _handle_persona(self, event: AstrMessageEvent, group_id: str = ""):
         """``/zl persona``：生成可粘贴进 AstrBot 的人格模板。"""
+        if not self._persona_cfg()["enabled"]:
+            yield self._reply(event, "⚠️ 人格模板功能已停用（persona_template.enabled 已关闭）。")
+            return
         active = self._active_for(group_id)
         if active is None:
             yield self._reply(event, self._no_target_hint(group_id))
@@ -510,6 +590,9 @@ class GroupDistillerPlugin(Star):
 
     async def _handle_push(self, event: AstrMessageEvent, group_id: str = ""):
         """``/zl push``：把人格模板直接写进 AstrBot 人格设定。"""
+        if not self._persona_cfg()["enabled"]:
+            yield self._reply(event, "⚠️ 人格模板功能已停用（persona_template.enabled 已关闭）。")
+            return
         active = self._active_for(group_id)
         if active is None:
             yield self._reply(event, self._no_target_hint(group_id))
@@ -750,6 +833,31 @@ class GroupDistillerPlugin(Star):
         await self._refresh_counts()
         yield self._reply(event, f"🧹 已清空 {removed} 条语料。（人格档案与纠正层仍保留）")
 
+    async def _handle_find(self, event: AstrMessageEvent, rest: str, group_id: str = ""):
+        """``/zl 查 <昵称或QQ>``：按昵称/QQ 查某人的 5 层人格档案。"""
+        query = rest.strip()
+        if not query:
+            yield self._reply(event, "用法：/查用户 <昵称或QQ号>（或 /zl 查 <昵称或QQ号>）")
+            return
+
+        spec = (
+            self.state.find_target_in_group(query, group_id)
+            if group_id
+            else self.state.find_target(query)
+        )
+        if spec is None:
+            if group_id and self.state.collect_targets():
+                yield self._reply(event, f"🤔 本群（{group_id}）没找到「{query}」，用 /zl list 看看。")
+            else:
+                yield self._reply(event, f"🤔 没找到「{query}」，用 /zl list 看看。")
+            return
+
+        snapshot = await self._load_snapshot(spec)
+        yield self._reply(
+            event,
+            progress.render_profile(snapshot, spec.display_name, spec.qq_id, spec.group_id),
+        )
+
     # ------------------------------------------------------------------ #
     # 渲染
     # ------------------------------------------------------------------ #
@@ -834,6 +942,8 @@ class GroupDistillerPlugin(Star):
         """渲染 ``/zl list``。"""
         specs = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
         if not specs:
+            if group_id and self.state.collect_targets():
+                return progress.render_no_target_in_group(group_id)
             return progress.render_target_list([])
         for spec in specs:
             await self._ensure_counts(spec)

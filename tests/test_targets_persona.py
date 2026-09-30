@@ -1104,6 +1104,243 @@ def test_zl_group_isolation() -> None:
     asyncio.run(scenario())
 
 
+# =========================================================================== #
+# 10. v0.7.0：噪声 ID 清洗 / persona 开关 / 按昵称查用户 / 计数缓存刷新
+# =========================================================================== #
+
+
+def test_add_set_clean_noisy_ids() -> None:
+    """add / set 对带噪声的群号使用 ``make_target`` 清洗后入库。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(_db("noisy_ids.db"), admin_only=False)
+        ev = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+
+        # 群号带 @ 前缀
+        out = await _collect(plugin.zl(ev(f"/zl add @{GID_A} {QQ_A} 老王")))
+        assert "已添加" in _text_of(out[0]), _text_of(out[0])
+        spec = plugin.state.targets[0]
+        assert spec.group_id == GID_A, spec.group_id
+        assert spec.qq_id == QQ_A, spec.qq_id
+        assert spec.nickname == "老王", spec.nickname
+
+        # 群号带「群号:」前缀（set 替换整份清单）
+        out = await _collect(plugin.zl(ev(f"/zl set 群号:{GID_A} {QQ_B}")))
+        assert "目标已设定" in _text_of(out[0]), _text_of(out[0])
+        assert len(plugin.state.targets) == 1, plugin.state.targets
+        assert plugin.state.targets[0].group_id == GID_A, plugin.state.targets[0].group_id
+        assert plugin.state.targets[0].qq_id == QQ_B, plugin.state.targets[0].qq_id
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_persona_push_respect_disabled_flag() -> None:
+    """``persona_template.enabled=False`` 时 persona / push 都应停用。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(
+            _db("persona_disabled.db"),
+            admin_only=False,
+            persona_template={"enabled": False},
+        )
+        mgr = FakePersonaMgr()
+        plugin.context.persona_manager = mgr
+        ev = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+
+        await _collect(plugin.zl(ev(f"/zl add {GID_A} {QQ_A} 老王")))
+        await plugin.storage.save_persona(GID_A, QQ_A, _rich_snapshot())
+
+        out = await _collect(plugin.zl(ev("/zl persona")))
+        assert "已停用" in _text_of(out[0]), _text_of(out[0])
+        assert "绝不发语音" not in "\n".join(_text_of(r) for r in out)
+
+        out = await _collect(plugin.zl(ev("/zl push")))
+        assert "已停用" in _text_of(out[0]), _text_of(out[0])
+        assert mgr.personas == {}, "停用后仍写入了人格"
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_list_empty_group_uses_group_hint() -> None:
+    """当前群无目标（但其它群有）时，``/zl list`` 应给本群专属引导。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        from core import progress
+
+        plugin, _ = await _make_plugin(
+            _db("list_empty_group.db"),
+            admin_only=False,
+            targets=[{"group_id": GID_B, "qq_id": QQ_C, "nickname": "阿呆"}],
+        )
+        await plugin._load_runtime_state()
+
+        out = await _collect(
+            plugin.zl(FakeEvent("/zl list", group_id=GID_A, sender_id="10001"))
+        )
+        listing = _text_of(out[0])
+        assert "还没有设定蒸馏目标" in listing, listing
+        assert GID_A in listing, f"提示里应带当前群号: {listing}"
+        assert listing == progress.render_no_target_in_group(GID_A), listing
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_split_target_args_two_segment_nickname() -> None:
+    """``<QQ> <昵称>``（第二段非数字）应解析为「当前群 + QQ + 昵称」。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(_db("two_seg.db"), admin_only=False)
+        ev = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+
+        out = await _collect(plugin.zl(ev(f"/zl add {QQ_A} 深渊之水")))
+        assert "已添加" in _text_of(out[0]), _text_of(out[0])
+        assert len(plugin.state.targets) == 1
+        spec = plugin.state.targets[0]
+        assert spec.group_id == GID_A, spec.group_id
+        assert spec.qq_id == QQ_A, spec.qq_id
+        assert spec.nickname == "深渊之水", spec.nickname
+
+        # 昵称带空格也应整段保留
+        out = await _collect(plugin.zl(ev(f"/zl add {QQ_B} 深渊 之水")))
+        assert "已添加" in _text_of(out[0]), _text_of(out[0])
+        assert plugin.state.targets[1].nickname == "深渊 之水", plugin.state.targets[1].nickname
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_find_target_by_nickname_or_qq() -> None:
+    """``/zl 查`` 与 ``/查用户`` 能按昵称/QQ 查档案，且不跨群泄露。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(
+            _db("find.db"),
+            admin_only=False,
+            targets=[
+                {"group_id": GID_A, "qq_id": QQ_A, "nickname": "老王"},
+                {"group_id": GID_B, "qq_id": QQ_C, "nickname": "阿呆"},
+            ],
+        )
+        await plugin._load_runtime_state()
+        await plugin.storage.save_persona(GID_A, QQ_A, _rich_snapshot())
+
+        ev_A = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+
+        # ① /zl 查 昵称 → 命中并渲染档案
+        out = await _collect(plugin.zl(ev_A("/zl 查 老王")))
+        profile = _text_of(out[0])
+        assert "老王" in profile and QQ_A in profile, profile
+        assert "绝不发语音" in profile, profile
+
+        # ② /zl 查 QQ → 命中
+        out = await _collect(plugin.zl(ev_A(f"/zl 查 {QQ_A}")))
+        assert QQ_A in _text_of(out[0]), _text_of(out[0])
+
+        # ③ 跨群目标查不到（不泄露 B 群 QQ）
+        out = await _collect(plugin.zl(ev_A("/zl 查 阿呆")))
+        assert "没找到" in _text_of(out[0]), _text_of(out[0])
+        assert QQ_C not in _text_of(out[0]), _text_of(out[0])
+
+        out = await _collect(plugin.zl(ev_A(f"/zl 查 {QQ_C}")))
+        assert "没找到" in _text_of(out[0]), _text_of(out[0])
+
+        # ④ 独立触发词 /查用户（带前缀）
+        out = await _collect(
+            plugin.chayonghu(FakeEvent("/查用户 老王", group_id=GID_A, sender_id="10001"))
+        )
+        assert "老王" in _text_of(out[0]) and QQ_A in _text_of(out[0]), _text_of(out[0])
+
+        # ⑤ 前缀被剥离后的形态也能工作
+        out = await _collect(
+            plugin.chayonghu(FakeEvent("老王", group_id=GID_A, sender_id="10001"))
+        )
+        assert QQ_A in _text_of(out[0]), _text_of(out[0])
+
+        # ⑥ 空查询给用法提示
+        out = await _collect(plugin.zl(ev_A("/zl 查")))
+        assert "用法" in _text_of(out[0]), _text_of(out[0])
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_del_use_clean_noisy_qq() -> None:
+    """del / use 应容忍 @ 前缀等噪声 QQ。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(
+            _db("noisy_qq.db"),
+            admin_only=False,
+            targets=[{"group_id": GID_A, "qq_id": QQ_A, "nickname": "老王"}],
+        )
+        await plugin._load_runtime_state()
+        ev = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+
+        # use @QQ → 切换成功
+        out = await _collect(plugin.zl(ev(f"/zl use @{QQ_A}")))
+        assert "已切换到" in _text_of(out[0]), _text_of(out[0])
+        assert plugin.state.active_target().qq_id == QQ_A
+
+        # del @QQ → 删除成功
+        out = await _collect(plugin.zl(ev(f"/zl del @{QQ_A}")))
+        assert "已删除 1 个目标" in _text_of(out[0]), _text_of(out[0])
+        assert plugin.state.targets == []
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_distill_refreshes_undistilled_cache() -> None:
+    """蒸馏后计数缓存必须用 mark 后的真实剩余量刷新（不再残留旧值）。"""
+    payload = json.dumps(
+        {"layer1_rules": [{"text": "低调", "confidence": 0.9}]}, ensure_ascii=False
+    )
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(
+            _db("count_refresh.db"), provider=FakeProvider(payload), admin_only=False
+        )
+        plugin.state.group_id = GID_A
+        plugin.state.qq_id = QQ_A
+        plugin.state.nickname = "老王"
+        plugin.state.enabled = True
+        plugin.state.listen_enabled = True
+
+        for i in range(5):
+            await plugin.collector.handle_event(
+                FakeEvent(f"语料{i}", group_id=GID_A, sender_id=QQ_A, message_id=f"cr{i}")
+            )
+        await plugin.collector.flush()
+
+        key = f"{GID_A}:{QQ_A}"
+        assert plugin.state.overview[key]["undistilled"] == 5, plugin.state.overview
+
+        await plugin.distiller._distill_once("umo")
+
+        assert plugin.state.overview[key]["undistilled"] == 0, plugin.state.overview[key]
+        assert await plugin.storage.count_undistilled(GID_A, QQ_A) == 0
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
 def main() -> int:
     """直接运行时的入口，逐个执行测试函数。"""
     tests = [
@@ -1133,6 +1370,13 @@ def main() -> int:
         test_auto_write_failure_does_not_break_distill,
         test_panel_shows_target_list_only_when_multiple,
         test_zl_group_isolation,
+        test_add_set_clean_noisy_ids,
+        test_persona_push_respect_disabled_flag,
+        test_list_empty_group_uses_group_hint,
+        test_split_target_args_two_segment_nickname,
+        test_find_target_by_nickname_or_qq,
+        test_del_use_clean_noisy_qq,
+        test_distill_refreshes_undistilled_cache,
     ]
     failures = 0
     for test in tests:

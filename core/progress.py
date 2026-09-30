@@ -396,6 +396,7 @@ def render_help(prefix: str = "/zl") -> str:
         f"{p} digest [all]   立即跑一次「每日总结」（用当天的全部对话蒸馏）",
         "— 档案与人格 —",
         f"{p} profile        查看当前目标的 5 层人格档案",
+        f"{p} 查 <昵称或QQ>  按昵称/QQ 查某人档案（或直接发 /查用户）",
         f"{p} persona        生成可粘贴进 AstrBot 的人格模板",
         f"{p} push           把人格模板直接写进 AstrBot 人格设定",
         f"{p} export         导出 persona_<QQ>.md 与人格模板到数据目录",

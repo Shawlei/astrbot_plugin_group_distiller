@@ -22,7 +22,7 @@
 - 🎨 **人设模板**：生成的人格照什么骨架来，可以选——内置「标准版 / 赛博群友分节版 / 精简版」三套，也可以自己写一份（用 `{{令牌}}` 挖槽位，任意重排 5 层、样例、纠正层）。
 - 🪪 **证据溯源**：每条结论都带「证据条数 + 代表性原话」。
 - 🧑‍⚖️ **人工纠正层**：`/zl correct` 写入的纠正优先级高于 LLM 推断，永久生效。
-- 📊 **群内进度面板**：`/zl` 看当前目标，`/zl list` 看全部目标清单。
+- 📊 **群内进度面板**：`/zl` 看当前目标，`/zl list` 看**当前群**的目标清单（跨群目标各自隔离）。
 - 🎛️ **模型选择器**：WebUI 里像选人格一样，从已配好的模型里挑一个专门干蒸馏。
 - 🪄 **人格模板**：把 5 层结论组装成 AstrBot 人格提示词，`/zl persona` 复制粘贴，或 `/zl push` **直接写进 AstrBot 的人格设定**；也可以设成档案达标后自动写入。
 - 🧱 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `asyncio`）+ AstrBot 本体，安装失败率极低。
@@ -173,7 +173,7 @@
 | 指令 | 行为 |
 | --- | --- |
 | `/zl` | 展示当前目标的进度面板（多目标时附目标清单） |
-| `/zl list` | 列出全部目标及各自进度、轮次、档案完整度 |
+| `/zl list` | 列出**当前群**的目标及各自进度、轮次、档案完整度（`distill all` / `digest all` 仍作用于全部目标） |
 | `/zl add <群号> <QQ号> [昵称]` | 添加一个蒸馏目标（也可只给 QQ 号，用当前群） |
 | `/zl del <QQ号> [purge]` | 删除目标；加 `purge` 连语料、档案、纠正层一起删 |
 | `/zl use <QQ号>` | 切换「当前目标」 |
@@ -183,6 +183,8 @@
 | `/zl distill [all]` | 手动蒸馏当前目标；加 `all` 则依次蒸馏全部目标 |
 | `/zl digest [all]` | **立刻跑一次「每日总结」**（用当天的全部对话蒸馏）|
 | `/zl profile` | 查看当前目标的 5 层人格档案 |
+| `/zl 查 <昵称或QQ>` | 按昵称或 QQ 号查某个目标的 5 层人格档案（仅当前群） |
+| `/查用户 <昵称或QQ>` | 独立触发词，等价于 `/zl 查`（别名 `/查群友`、`/查询用户`） |
 | `/zl persona` | 生成可粘贴进 AstrBot 的人格模板 |
 | `/zl push` | 把人格模板**直接写进** AstrBot 人格设定 |
 | `/zl export` | 导出 `persona_<QQ>.md` 与人格模板到数据目录 |
@@ -427,7 +429,7 @@ astrbot_plugin_group_distiller/
 ```bash
 python tests/test_core.py              # 9/9
 python tests/test_qa_verify.py         # 29/29
-python tests/test_targets_persona.py   # 25/25
+python tests/test_targets_persona.py   # 33/33
 python tests/test_daily_digest.py      # 28/28
 python tests/test_detail_persona.py    # 18/18
 python tests/test_persona_templates.py # 15/15

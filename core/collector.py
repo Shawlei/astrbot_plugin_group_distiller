@@ -32,10 +32,10 @@ except ImportError:  # pragma: no cover - 仅在无 AstrBot 环境触发
 
 try:
     from .storage import MessageRecord, Storage
-    from .targets import TargetSpec, dedupe
+    from .targets import TargetSpec, _clean_id, dedupe
 except ImportError:  # pragma: no cover - 兼容顶层导入
     from storage import MessageRecord, Storage  # type: ignore
-    from targets import TargetSpec, dedupe  # type: ignore
+    from targets import TargetSpec, _clean_id, dedupe  # type: ignore
 
 PLUGIN_NAME = "astrbot_plugin_group_distiller"
 
@@ -132,6 +132,30 @@ class RuntimeState:
         qq = str(qq or "").strip()
         for spec in self.collect_targets():
             if spec.qq_id == qq:
+                return spec
+        return None
+
+    def find_target_in_group(self, qq_or_nick: str, group_id: str) -> Optional[TargetSpec]:
+        """在本群内按 QQ 或昵称查目标；未命中返回 None。
+
+        匹配优先级：①QQ 精确（先清洗噪声再比 ``spec.qq_id``）→ ②昵称精确
+        （``spec.nickname == q``）→ ③昵称子串（双向包含）。
+        """
+        q = str(qq_or_nick or "").strip()
+        group_id = str(group_id or "")
+        if not q:
+            return None
+        clean_qq = _clean_id(q)
+        group_targets = self.targets_in_group(group_id)
+        if clean_qq:
+            for spec in group_targets:
+                if spec.qq_id == clean_qq:
+                    return spec
+        for spec in group_targets:
+            if spec.nickname == q:
+                return spec
+        for spec in group_targets:
+            if spec.nickname and (q in spec.nickname or spec.nickname in q):
                 return spec
         return None
 
