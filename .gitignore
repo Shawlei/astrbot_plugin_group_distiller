@@ -22,6 +22,12 @@ ENV/
 .coverage
 htmlcov/
 
+# 测试临时目录（单元测试产生的临时库与导出文件）
+tests/_qa_tmp/
+tests/_tmp_mt/
+tests/_tmp_dd/
+.tmp/
+
 # 数据库与运行时数据
 *.db
 *.db-wal

@@ -644,41 +644,48 @@ def test_zl_target_management_commands() -> None:
     async def scenario():
         install_fake_astrbot()
         plugin, _ = await _make_plugin(_db("mgmt.db"), admin_only=False)
-        ev = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+        ev_A = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+        ev_B = lambda s: FakeEvent(s, group_id=GID_B, sender_id="10001")  # noqa: E731
 
         # ① add 三个目标（两个同群、一个在另一个群）
-        await _collect(plugin.zl(ev(f"/zl add {GID_A} {QQ_A} 老王")))
-        await _collect(plugin.zl(ev(f"/zl add {GID_A} {QQ_B} 小李")))
-        out = await _collect(plugin.zl(ev(f"/zl add {GID_B} {QQ_C} 小 张 张")))
+        await _collect(plugin.zl(ev_A(f"/zl add {GID_A} {QQ_A} 老王")))
+        await _collect(plugin.zl(ev_A(f"/zl add {GID_A} {QQ_B} 小李")))
+        out = await _collect(plugin.zl(ev_A(f"/zl add {GID_B} {QQ_C} 小 张 张")))
         assert "已添加" in _text_of(out[0]), _text_of(out[0])
         assert len(plugin.state.targets) == 3, plugin.state.targets
         assert plugin.state.targets[2].nickname == "小 张 张"
         assert plugin.state.active_target().qq_id == QQ_C  # 新加的成为当前
 
         # ② 重复添加同一个目标 → 只更新，不重复计入
-        out = await _collect(plugin.zl(ev(f"/zl add {GID_A} {QQ_A}")))
+        out = await _collect(plugin.zl(ev_A(f"/zl add {GID_A} {QQ_A}")))
         assert "已更新" in _text_of(out[0]), _text_of(out[0])
         assert len(plugin.state.targets) == 3
 
-        # ③ list 应列出全部三个
-        out = await _collect(plugin.zl(ev("/zl list")))
+        # ③ list 按群隔离：A 群只见 A 群两个，B 群只见 B 群一个
+        out = await _collect(plugin.zl(ev_A("/zl list")))
         listing = _text_of(out[0])
-        assert "共 3 个" in listing, listing
-        for qq in (QQ_A, QQ_B, QQ_C):
-            assert qq in listing, f"清单缺 {qq}"
+        assert "共 2 个" in listing, listing
+        assert QQ_A in listing and QQ_B in listing
+        assert QQ_C not in listing, f"A 群清单不该串进 B 群目标: {listing}"
+
+        out_b = await _collect(plugin.zl(ev_B("/zl list")))
+        listing_b = _text_of(out_b[0])
+        assert "共 1 个" in listing_b, listing_b
+        assert QQ_C in listing_b
+        assert QQ_A not in listing_b and QQ_B not in listing_b
 
         # ④ use 切换
-        out = await _collect(plugin.zl(ev(f"/zl use {QQ_A}")))
+        out = await _collect(plugin.zl(ev_A(f"/zl use {QQ_A}")))
         assert "已切换到" in _text_of(out[0]), _text_of(out[0])
         assert plugin.state.active_target().qq_id == QQ_A
         assert plugin.state.qq_id == QQ_A
 
         # ⑤ 非法输入被友好拒绝
-        out = await _collect(plugin.zl(ev("/zl add abc 123")))
+        out = await _collect(plugin.zl(ev_A("/zl add abc 123")))
         assert "群号必须是纯数字" in _text_of(out[0])
-        out = await _collect(plugin.zl(ev("/zl add " + GID_A + " abc")))
+        out = await _collect(plugin.zl(ev_A("/zl add " + GID_A + " abc")))
         assert "QQ 号必须是纯数字" in _text_of(out[0])
-        out = await _collect(plugin.zl(ev("/zl add")))
+        out = await _collect(plugin.zl(ev_A("/zl add")))
         assert "用法" in _text_of(out[0])
 
         # ⑥ 持久化：目标清单已写进 state 表
@@ -687,25 +694,25 @@ def test_zl_target_management_commands() -> None:
         assert len(saved) == 3, saved
         assert await plugin.storage.get_state("rt_active_key") == f"{GID_A}:{QQ_A}"
 
-        # ⑦ del（不 purge）→ 只摘掉目标
-        out = await _collect(plugin.zl(ev(f"/zl del {QQ_C}")))
+        # ⑦ del（不 purge）→ 只摘掉 B 群的目标（QQ_C 在 GID_B）
+        out = await _collect(plugin.zl(ev_B(f"/zl del {QQ_C}")))
         assert "已删除 1 个目标" in _text_of(out[0]), _text_of(out[0])
         assert len(plugin.state.targets) == 2
         assert QQ_C not in await plugin.storage.get_state("rt_targets")
 
         # ⑧ del 不存在的目标 → 给出提示而不是静默
-        out = await _collect(plugin.zl(ev("/zl del 999999999")))
+        out = await _collect(plugin.zl(ev_A("/zl del 999999999")))
         assert "没找到" in _text_of(out[0]), _text_of(out[0])
 
-        # ⑨ set 会替换整份清单
-        await _collect(plugin.zl(ev(f"/zl set {GID_B} {QQ_C} 阿呆")))
+        # ⑨ set 会替换整份清单（显式群号，不受当前群影响）
+        await _collect(plugin.zl(ev_A(f"/zl set {GID_B} {QQ_C} 阿呆")))
         assert len(plugin.state.targets) == 1
         assert plugin.state.active_target().key == f"{GID_B}:{QQ_C}"
 
-        # ⑩ 目标被删光后，面板回到"未设定目标"引导
-        await _collect(plugin.zl(ev(f"/zl del {QQ_C} purge")))
+        # ⑩ 目标被删光后，面板回到"未设定目标"引导（QQ_C 在 GID_B，用 ev_B 删）
+        await _collect(plugin.zl(ev_B(f"/zl del {QQ_C} purge")))
         assert plugin.state.targets == []
-        out = await _collect(plugin.zl(ev("/zl")))
+        out = await _collect(plugin.zl(ev_A("/zl")))
         assert "还没有设定蒸馏目标" in _text_of(out[0]), _text_of(out[0])
 
         await plugin.storage.close()
@@ -1033,6 +1040,70 @@ def test_panel_shows_target_list_only_when_multiple() -> None:
     asyncio.run(scenario())
 
 
+def test_zl_group_isolation() -> None:
+    """``/zl`` 指令族按群隔离：A 群只看 A 群目标，B 群只看 B 群目标。"""
+
+    async def scenario():
+        install_fake_astrbot()
+        plugin, _ = await _make_plugin(
+            _db("isolation.db"),
+            admin_only=False,
+            targets=[
+                {"group_id": GID_A, "qq_id": QQ_A, "nickname": "老王"},
+                {"group_id": GID_A, "qq_id": QQ_B, "nickname": "小李"},
+                {"group_id": GID_B, "qq_id": QQ_C, "nickname": "阿呆"},
+            ],
+        )
+        await plugin._load_runtime_state()
+
+        ev_A = lambda s: FakeEvent(s, group_id=GID_A, sender_id="10001")  # noqa: E731
+        ev_B = lambda s: FakeEvent(s, group_id=GID_B, sender_id="10001")  # noqa: E731
+
+        # ① 面板：A 群只见 A 群目标，不出现 B 群 QQ
+        out = await _collect(plugin.zl(ev_A("/zl")))
+        panel = _text_of(out[0])
+        assert QQ_A in panel and QQ_B in panel, panel
+        assert QQ_C not in panel, f"A 群面板不该串进 B 群目标: {panel}"
+
+        # ② list 各自只列本群
+        list_a = _text_of((await _collect(plugin.zl(ev_A("/zl list"))))[0])
+        assert "共 2 个" in list_a, list_a
+        assert QQ_A in list_a and QQ_B in list_a and QQ_C not in list_a
+        list_b = _text_of((await _collect(plugin.zl(ev_B("/zl list"))))[0])
+        assert "共 1 个" in list_b, list_b
+        assert QQ_C in list_b and QQ_A not in list_b and QQ_B not in list_b
+
+        # ③ now 显示的目标属于 A 群
+        now_a = _text_of((await _collect(plugin.zl(ev_A("/zl now"))))[0])
+        assert GID_A in now_a, now_a
+        assert GID_B not in now_a, now_a
+
+        # ④ 在 A 群 use B 群的 QQ → 找不到，且 active 不被改到 B 群
+        assert plugin.state.active_key == f"{GID_A}:{QQ_A}"
+        out = await _collect(plugin.zl(ev_A(f"/zl use {QQ_C}")))
+        assert "没找到" in _text_of(out[0]), _text_of(out[0])
+        assert plugin.state.active_key == f"{GID_A}:{QQ_A}", "use 不应把 active 改到别的群"
+
+        # ⑤ 在 A 群 del B 群的 QQ → 找不到，B 群目标不受影响
+        out = await _collect(plugin.zl(ev_A(f"/zl del {QQ_C}")))
+        assert "没找到" in _text_of(out[0]), _text_of(out[0])
+        assert any(t.key == f"{GID_B}:{QQ_C}" for t in plugin.state.targets), "B 群目标被误删"
+
+        # ⑥ B 群 profile / persona 只针对 QQ_C
+        await plugin.storage.save_persona(GID_B, QQ_C, _rich_snapshot())
+        prof_b = _text_of((await _collect(plugin.zl(ev_B("/zl profile"))))[0])
+        assert QQ_C in prof_b and "阿呆" in prof_b, prof_b
+        assert QQ_A not in prof_b and "老王" not in prof_b, f"B 群档案串进了 A 群目标: {prof_b}"
+
+        persona_b = "\n".join(_text_of(r) for r in await _collect(plugin.zl(ev_B("/zl persona"))))
+        assert QQ_C in persona_b and "阿呆" in persona_b, persona_b
+        assert QQ_A not in persona_b and "老王" not in persona_b, f"B 群人格串进了 A 群目标"
+
+        await plugin.storage.close()
+
+    asyncio.run(scenario())
+
+
 def main() -> int:
     """直接运行时的入口，逐个执行测试函数。"""
     tests = [
@@ -1061,6 +1132,7 @@ def main() -> int:
         test_auto_write_persona_after_distill,
         test_auto_write_failure_does_not_break_distill,
         test_panel_shows_target_list_only_when_multiple,
+        test_zl_group_isolation,
     ]
     failures = 0
     for test in tests:

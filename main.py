@@ -5,7 +5,7 @@
 AstrBot 的「人格设定」。
 
 作者：Shawlei
-版本：v0.2.0
+版本：v0.6.0
 仓库：https://github.com/Shawlei/astrbot_plugin_group_distiller
 """
 
@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover
 
 PLUGIN_NAME = "astrbot_plugin_group_distiller"
 PLUGIN_DISPLAY = "我要蒸馏群友"
-PLUGIN_VERSION = "v0.2.0"
+PLUGIN_VERSION = "v0.6.0"
 
 # 可能出现在 message_str 开头的指令前缀（AstrBot 有时会剥离，有时不会）
 _PREFIXES = ("/zl", "zl", "／zl", "/蒸馏", "蒸馏", "／蒸馏")
@@ -216,10 +216,11 @@ class GroupDistillerPlugin(Star):
             return
 
         head, rest = _parse_command(getattr(event, "message_str", "") or "")
+        group_id = str(event.get_group_id() or "")
 
         try:
             if head in ("", "panel", "菜单", "进度"):
-                yield self._reply(event, await self._build_panel())
+                yield self._reply(event, await self._build_panel(group_id))
 
             elif head == "on":
                 self.state.enabled = True
@@ -241,61 +242,73 @@ class GroupDistillerPlugin(Star):
                     yield reply
 
             elif head in _HEADS_DEL:
-                async for reply in self._handle_del(event, rest):
+                async for reply in self._handle_del(event, rest, group_id):
                     yield reply
 
             elif head in _HEADS_USE:
-                async for reply in self._handle_use(event, rest):
+                async for reply in self._handle_use(event, rest, group_id):
                     yield reply
 
             elif head in _HEADS_LIST:
-                yield self._reply(event, await self._render_target_list())
+                yield self._reply(event, await self._render_target_list(group_id))
 
             elif head in ("now",):
-                yield self._reply(event, self._render_target())
+                yield self._reply(event, self._render_target(group_id))
 
             elif head in ("distill", "蒸馏", "开始"):
                 all_targets = rest.strip().lower() in ("all", "全部", "所有", "全")
-                result = await self.distiller.trigger(
-                    event.unified_msg_origin, manual=True, all_targets=all_targets
-                )
+                if all_targets:
+                    result = await self.distiller.trigger(
+                        event.unified_msg_origin, manual=True, all_targets=True
+                    )
+                else:
+                    target = self._active_for(group_id)
+                    if target is None:
+                        yield self._reply(event, self._no_target_hint(group_id))
+                        return
+                    result = await self.distiller.trigger(
+                        event.unified_msg_origin, manual=True, target=target
+                    )
                 yield self._reply(event, result.message)
 
             elif head in ("digest", "总结", "日报", "每日总结"):
-                async for reply in self._handle_digest(event, rest):
+                async for reply in self._handle_digest(event, rest, group_id):
                     yield reply
 
             elif head in ("profile", "档案", "画像"):
-                snapshot = await self._load_snapshot()
-                active = self.state.active_target()
+                active = self._active_for(group_id)
+                if active is None:
+                    yield self._reply(event, self._no_target_hint(group_id))
+                    return
+                snapshot = await self._load_snapshot(active)
                 yield self._reply(
                     event,
                     progress.render_profile(
                         snapshot,
-                        self.state.nickname,
-                        self.state.qq_id,
-                        active.group_id if active else "",
+                        active.display_name,
+                        active.qq_id,
+                        active.group_id,
                     ),
                 )
 
             elif head in _HEADS_PERSONA:
-                async for reply in self._handle_persona(event):
+                async for reply in self._handle_persona(event, group_id):
                     yield reply
 
             elif head in _HEADS_PUSH:
-                async for reply in self._handle_push(event):
+                async for reply in self._handle_push(event, group_id):
                     yield reply
 
             elif head in ("export", "导出"):
-                async for reply in self._handle_export(event):
+                async for reply in self._handle_export(event, group_id):
                     yield reply
 
             elif head in ("correct", "纠正"):
-                async for reply in self._handle_correct(event, rest):
+                async for reply in self._handle_correct(event, rest, group_id):
                     yield reply
 
             elif head in ("reset", "重置"):
-                async for reply in self._handle_reset(event, rest):
+                async for reply in self._handle_reset(event, rest, group_id):
                     yield reply
 
             elif head in ("help", "帮助", "?", "？"):
@@ -312,6 +325,18 @@ class GroupDistillerPlugin(Star):
     # ------------------------------------------------------------------ #
     # 目标管理子命令
     # ------------------------------------------------------------------ #
+
+    def _active_for(self, group_id: str) -> Optional[TargetSpec]:
+        """按群取当前目标；group_id 为空时退化为全局当前目标。"""
+        if group_id:
+            return self.state.active_target_in_group(group_id)
+        return self.state.active_target()
+
+    def _no_target_hint(self, group_id: str) -> str:
+        """无目标时的提示；按群隔离时区分「本群无目标」与「全局无目标」。"""
+        if group_id and self.state.collect_targets():
+            return f"⚠️ 本群（{group_id}）还没有设定蒸馏目标，先 /zl add <群号> <QQ号>。"
+        return "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。"
 
     @staticmethod
     def _split_target_args(rest: str, event: AstrMessageEvent) -> tuple[str, str, str]:
@@ -390,7 +415,7 @@ class GroupDistillerPlugin(Star):
             f"当前选中 {(self.state.active_target() or spec).label()}。",
         )
 
-    async def _handle_del(self, event: AstrMessageEvent, rest: str):
+    async def _handle_del(self, event: AstrMessageEvent, rest: str, group_id: str = ""):
         """``/zl del <QQ号> [purge]``：删除目标；加 purge 连语料与档案一起删。"""
         parts = rest.split()
         if not parts:
@@ -409,12 +434,18 @@ class GroupDistillerPlugin(Star):
             yield self._reply(event, "⚠️ QQ 号必须是纯数字（5~20 位）。")
             return
 
-        doomed = [t for t in self.state.collect_targets() if t.qq_id == qq]
+        scope = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
+        doomed = [t for t in scope if t.qq_id == qq]
         if not doomed:
-            yield self._reply(event, f"🤔 没找到 QQ 号为 {qq} 的目标，用 /zl list 看看。")
+            if group_id and self.state.collect_targets():
+                yield self._reply(
+                    event, f"🤔 本群（{group_id}）没找到 QQ 号为 {qq} 的目标，用 /zl list 看看。"
+                )
+            else:
+                yield self._reply(event, f"🤔 没找到 QQ 号为 {qq} 的目标，用 /zl list 看看。")
             return
 
-        removed = self.state.remove_target(qq)
+        removed = self.state.remove_target_in_group(qq, group_id) if group_id else self.state.remove_target(qq)
         for spec in doomed:
             self.state.overview.pop(spec.key, None)
             if purge:
@@ -429,14 +460,18 @@ class GroupDistillerPlugin(Star):
             f"剩余 {len(self.state.targets)} 个目标。",
         )
 
-    async def _handle_use(self, event: AstrMessageEvent, rest: str):
+    async def _handle_use(self, event: AstrMessageEvent, rest: str, group_id: str = ""):
         """``/zl use <QQ号>``：切换当前选中目标。"""
         key = rest.strip()
         if not key:
             yield self._reply(event, "用法：/zl use <QQ号>")
             return
-        if not self.state.set_active(key):
-            yield self._reply(event, f"🤔 没找到目标「{key}」，用 /zl list 看看。")
+        ok = self.state.set_active_in_group(key, group_id) if group_id else self.state.set_active(key)
+        if not ok:
+            if group_id and self.state.collect_targets():
+                yield self._reply(event, f"🤔 本群（{group_id}）没找到目标「{key}」，用 /zl list 看看。")
+            else:
+                yield self._reply(event, f"🤔 没找到目标「{key}」，用 /zl list 看看。")
             return
         await self._refresh_counts()
         await self._persist_state()
@@ -447,14 +482,14 @@ class GroupDistillerPlugin(Star):
             f"该目标现有语料 {self.state.total_messages} 条。",
         )
 
-    async def _handle_persona(self, event: AstrMessageEvent):
+    async def _handle_persona(self, event: AstrMessageEvent, group_id: str = ""):
         """``/zl persona``：生成可粘贴进 AstrBot 的人格模板。"""
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         if active is None:
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。")
+            yield self._reply(event, self._no_target_hint(group_id))
             return
 
-        snapshot = await self._load_snapshot()
+        snapshot = await self._load_snapshot(active)
         persona_id = self._persona_id(active)
         template = self._build_persona_text(active, snapshot)
         chunks = progress.chunk_text(template)
@@ -473,14 +508,14 @@ class GroupDistillerPlugin(Star):
         for chunk in chunks:
             yield event.plain_result(chunk)
 
-    async def _handle_push(self, event: AstrMessageEvent):
+    async def _handle_push(self, event: AstrMessageEvent, group_id: str = ""):
         """``/zl push``：把人格模板直接写进 AstrBot 人格设定。"""
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         if active is None:
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。")
+            yield self._reply(event, self._no_target_hint(group_id))
             return
 
-        snapshot = await self._load_snapshot()
+        snapshot = await self._load_snapshot(active)
         if not snapshot:
             yield self._reply(
                 event, "⚠️ 这个目标还没有档案，先攒语料并跑一轮 /zl distill。"
@@ -509,34 +544,37 @@ class GroupDistillerPlugin(Star):
     # 每日定时总结
     # ------------------------------------------------------------------ #
 
-    async def _handle_digest(self, event: AstrMessageEvent, rest: str):
+    async def _handle_digest(self, event: AstrMessageEvent, rest: str, group_id: str = ""):
         """``/zl digest [all]``：立刻跑一次「每日总结」（用当天的全部对话）。"""
-        specs = self.state.collect_targets()
+        scope_all = rest.strip().lower() in ("all", "全部", "所有", "全")
+        if scope_all:
+            specs = self.state.collect_targets()
+        else:
+            specs = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
         if not specs:
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add <群号> <QQ号>。")
+            yield self._reply(event, self._no_target_hint(group_id))
             return
         if self.distiller.is_running():
             yield self._reply(event, "⏳ 已有蒸馏正在进行，等它跑完再试。")
             return
 
-        scope_all = rest.strip().lower() in ("all", "全部", "所有", "全")
-        scope = "全部 %d 个目标" % len(specs) if scope_all else self._reply_scope()
+        scope = "全部 %d 个目标" % len(specs) if scope_all else self._reply_scope(group_id)
         umo = event.unified_msg_origin
 
         # 蒸馏可能耗时（要调 LLM），扔后台跑，先立刻回执，跑完再回报结果
-        asyncio.create_task(self._daily_digest_then_report(umo, scope_all))
+        asyncio.create_task(self._daily_digest_then_report(umo, scope_all, group_id))
         yield self._reply(
             event,
             f"🔬 已开始跑每日总结（{scope}，使用今天的全部对话）。\n"
             "完成后我会回一条结果。",
         )
 
-    def _reply_scope(self) -> str:
+    def _reply_scope(self, group_id: str = "") -> str:
         """当前目标的简短描述，用于回执文案。"""
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         return active.label() if active else "当前目标"
 
-    async def _daily_digest_then_report(self, umo: str, scope_all: bool) -> None:
+    async def _daily_digest_then_report(self, umo: str, scope_all: bool, group_id: str = "") -> None:
         """后台执行每日总结，并把结果回发到发起会话。"""
         now = int(time.time())
         day_start = schedule.day_start_ts(now)
@@ -546,7 +584,7 @@ class GroupDistillerPlugin(Star):
                     self._umo_for, day_start, now, min_messages=0
                 )
             else:
-                spec = self.state.active_target()
+                spec = self._active_for(group_id)
                 if spec is None:
                     ok, detail = True, "没有配置目标"
                 else:
@@ -650,14 +688,14 @@ class GroupDistillerPlugin(Star):
     # 其他子命令
     # ------------------------------------------------------------------ #
 
-    async def _handle_export(self, event: AstrMessageEvent):
+    async def _handle_export(self, event: AstrMessageEvent, group_id: str = ""):
         """``/zl export``：导出 Markdown 档案 + 人格模板到数据目录。"""
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         if active is None:
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add。")
+            yield self._reply(event, self._no_target_hint(group_id))
             return
         try:
-            snapshot = await self._load_snapshot() or empty_snapshot()
+            snapshot = await self._load_snapshot(active) or empty_snapshot()
             markdown = prompts.render_export_markdown(
                 snapshot, active.display_name, active.qq_id, PLUGIN_DISPLAY
             )
@@ -679,11 +717,11 @@ class GroupDistillerPlugin(Star):
             logger.error("[%s] 导出失败: %s", PLUGIN_NAME, exc, exc_info=True)
             yield self._reply(event, "😵 导出失败，请查看后台日志。")
 
-    async def _handle_correct(self, event: AstrMessageEvent, rest: str):
+    async def _handle_correct(self, event: AstrMessageEvent, rest: str, group_id: str = ""):
         """``/zl correct <内容>`` / ``/zl 纠正 <内容>``。"""
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         if active is None:
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add。")
+            yield self._reply(event, self._no_target_hint(group_id))
             return
         content = rest.strip()
         if not content:
@@ -695,11 +733,11 @@ class GroupDistillerPlugin(Star):
         else:
             yield self._reply(event, "😵 写入纠正失败，请查看后台日志。")
 
-    async def _handle_reset(self, event: AstrMessageEvent, rest: str):
+    async def _handle_reset(self, event: AstrMessageEvent, rest: str, group_id: str = ""):
         """``/zl reset confirm``：二次确认后清空当前目标的语料。"""
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         if active is None:
-            yield self._reply(event, "⚠️ 还没有设定目标，先 /zl add。")
+            yield self._reply(event, self._no_target_hint(group_id))
             return
         if rest.strip().lower() not in ("confirm", "确认", "yes", "y"):
             yield self._reply(
@@ -716,17 +754,19 @@ class GroupDistillerPlugin(Star):
     # 渲染
     # ------------------------------------------------------------------ #
 
-    async def _build_panel(self) -> str:
+    async def _build_panel(self, group_id: str = "") -> str:
         """组装并渲染进度面板。"""
-        specs = self.state.collect_targets()
+        specs = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
         if not specs:
+            if group_id and self.state.collect_targets():
+                return progress.render_no_target_in_group(group_id)
             return progress.render_no_target()
 
         for spec in specs:
             await self._ensure_counts(spec)
 
-        active = self.state.active_target() or specs[0]
-        snapshot = await self._load_snapshot()
+        active = self._active_for(group_id) or specs[0]
+        snapshot = await self._load_snapshot(active)
         meta = snapshot.get("meta", {}) if isinstance(snapshot, dict) else {}
         min_ts, max_ts = await self.storage.get_time_span(active.group_id, active.qq_id)
         counts = self.state.counts_for(active)
@@ -790,22 +830,25 @@ class GroupDistillerPlugin(Star):
             )
         return rows
 
-    async def _render_target_list(self) -> str:
+    async def _render_target_list(self, group_id: str = "") -> str:
         """渲染 ``/zl list``。"""
-        specs = self.state.collect_targets()
+        specs = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
         if not specs:
             return progress.render_target_list([])
         for spec in specs:
             await self._ensure_counts(spec)
-        rows = await self._build_rows(specs, self.state.active_key)
-        return progress.render_target_list(rows, self.state.active_key)
+        active_key = (self._active_for(group_id).key if group_id else self.state.active_key) or ""
+        rows = await self._build_rows(specs, active_key)
+        return progress.render_target_list(rows, active_key)
 
-    def _render_target(self) -> str:
+    def _render_target(self, group_id: str = "") -> str:
         """渲染 ``/zl now`` 的目标信息。"""
-        specs = self.state.collect_targets()
+        specs = self.state.targets_in_group(group_id) if group_id else self.state.collect_targets()
         if not specs:
+            if group_id and self.state.collect_targets():
+                return f"❗ 本群（{group_id}）还没有设定蒸馏目标。用 /zl add <群号> <QQ号> 添加。"
             return "❗ 当前还没有设定目标。用 /zl add <群号> <QQ号> 添加。"
-        active = self.state.active_target()
+        active = self._active_for(group_id)
         listen = "开启" if (self.state.enabled and self.state.listen_enabled) else "关闭"
         lines = [
             f"🎯 当前目标：{active.label() if active else '未知'}",

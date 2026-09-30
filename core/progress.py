@@ -195,6 +195,19 @@ def render_no_target() -> str:
     return "\n".join(lines)
 
 
+def render_no_target_in_group(group_id: str) -> str:
+    """某群尚无目标时的友好引导面板（区别于全局无目标）。"""
+    lines = [
+        f"🧪 群友蒸馏 · {PLUGIN_DISPLAY}",
+        SEP,
+        f"❗ 本群（{group_id}）还没有设定蒸馏目标",
+        "请在 WebUI 插件配置里添加，或在本群用指令：/zl add <群号> <QQ号>",
+        SEP,
+        "💡 /zl help 查看全部指令",
+    ]
+    return "\n".join(lines)
+
+
 def render_panel(data: PanelData) -> str:
     """渲染 ``/zl`` 默认进度面板。"""
     if not data.has_target:

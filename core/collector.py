@@ -140,6 +140,44 @@ class RuntimeState:
         group_id = str(group_id or "")
         return [t for t in self.collect_targets() if t.group_id == group_id]
 
+    def active_target_in_group(self, group_id: str) -> Optional[TargetSpec]:
+        """按群解析当前目标：优先返回 active_key 命中的（若在该群），否则该群第一个目标；该群无目标返回 None。"""
+        group_id = str(group_id or "")
+        group_targets = self.targets_in_group(group_id)
+        if not group_targets:
+            return None
+        if self.active_key:
+            for spec in group_targets:
+                if spec.key == self.active_key:
+                    return spec
+        return group_targets[0]
+
+    def set_active_in_group(self, key: str, group_id: str) -> bool:
+        """只在当前群内把目标设为选中；key 可为完整键或 QQ 号；失败返回 False。"""
+        key = str(key or "").strip()
+        group_id = str(group_id or "")
+        for spec in self.targets_in_group(group_id):
+            if spec.key == key or spec.qq_id == key:
+                self.active_key = spec.key
+                self.sync_active_fields()
+                return True
+        return False
+
+    def remove_target_in_group(self, qq: str, group_id: str) -> int:
+        """只删除当前群内 QQ 对应的目标；group_id 为空则退化为按 QQ 全局删除。返回删除条数。"""
+        qq = str(qq or "").strip()
+        group_id = str(group_id or "")
+        before = len(self.targets)
+        if group_id:
+            self.targets = [t for t in self.targets if not (t.qq_id == qq and t.group_id == group_id)]
+        else:
+            self.targets = [t for t in self.targets if t.qq_id != qq]
+        removed = before - len(self.targets)
+        if removed and self.active_key not in {t.key for t in self.targets}:
+            self.active_key = self.targets[0].key if self.targets else ""
+            self.sync_active_fields()
+        return removed
+
     def add_target(self, spec: TargetSpec) -> bool:
         """新增一个目标（已存在则只更新昵称）。返回是否为新增。
 
