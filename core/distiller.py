@@ -97,6 +97,24 @@ def normalize_text(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "")).lower()
 
 
+def _evidence_of(item: Any) -> int:
+    """从条目/样例里安全取出 ``evidence``（缺省 1）。"""
+    try:
+        return int(item.get("evidence", 1) or 1) if isinstance(item, dict) else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _confidence_of(item: Any) -> float:
+    """从条目里安全取出 ``confidence``（缺省 0.0）。"""
+    if not isinstance(item, dict):
+        return 0.0
+    try:
+        return float(item.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _as_list(value: Any) -> list[Any]:
     """把"设计上是数组"的字段归一化为 list，杜绝字符串被逐字符拆散。
 
@@ -261,6 +279,91 @@ def _copy_layers(existing: Optional[dict[str, Any]]) -> dict[str, Any]:
     return snap
 
 
+def cap_snapshot(snapshot: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """对快照做确定性有界裁剪（纯函数，不修改入参）。
+
+    这是防「多轮蒸馏无限膨胀」的第一层兜底，永远生效：
+
+    - 每个 ``prompts.LAYER_KEYS`` 层保留 evidence 最高（其次 confidence 最高）的
+      ``prompts.MAX_ITEMS_PER_LAYER`` 条，并保持原有相对顺序；
+    - ``speech_samples`` 沿用 ``prompts.MAX_SPEECH_SAMPLES`` 上限；
+    - ``uncertainty`` 先按归一化文本去重，再保留前 ``prompts.MAX_UNCERTAINTY`` 条；
+    - ``meta`` 与 ``corrections`` 原样保留。
+
+    Args:
+        snapshot: 待裁剪的快照。
+
+    Returns:
+        裁剪后的新快照 dict（入参不会被原地修改）。
+    """
+    if not isinstance(snapshot, dict):
+        return empty_snapshot()
+
+    snap = dict(snapshot)  # 浅拷贝顶层，避免改动入参；meta/corrections 引用保留
+    layers = snapshot.get("layers")
+    if not isinstance(layers, dict):
+        layers = {}
+
+    new_layers: dict[str, list[dict[str, Any]]] = {}
+    for key in prompts.LAYER_KEYS:
+        items = [it for it in _as_list(layers.get(key)) if isinstance(it, dict)]
+        if len(items) > prompts.MAX_ITEMS_PER_LAYER:
+            keep = sorted(
+                range(len(items)),
+                key=lambda i: (_evidence_of(items[i]), _confidence_of(items[i])),
+                reverse=True,
+            )[: prompts.MAX_ITEMS_PER_LAYER]
+            keep_set = set(keep)
+            items = [it for i, it in enumerate(items) if i in keep_set]
+        new_layers[key] = items
+    snap["layers"] = new_layers
+
+    samples = [s for s in _as_list(snapshot.get(prompts.SAMPLE_KEY)) if isinstance(s, dict)]
+    if len(samples) > prompts.MAX_SPEECH_SAMPLES:
+        keep = sorted(
+            range(len(samples)),
+            key=lambda i: _evidence_of(samples[i]),
+            reverse=True,
+        )[: prompts.MAX_SPEECH_SAMPLES]
+        keep_set = set(keep)
+        samples = [s for i, s in enumerate(samples) if i in keep_set]
+    snap[prompts.SAMPLE_KEY] = samples
+
+    uncertainty: list[str] = []
+    seen: set[str] = set()
+    for raw in _as_list(snapshot.get("uncertainty")):
+        su = str(raw).strip()
+        if not su:
+            continue
+        norm = normalize_text(su)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        uncertainty.append(su)
+        if len(uncertainty) >= prompts.MAX_UNCERTAINTY:
+            break
+    snap["uncertainty"] = uncertainty
+
+    return snap
+
+
+def snapshot_item_count(snapshot: Optional[dict[str, Any]]) -> int:
+    """统计快照条目总数（5 层 + speech_samples + uncertainty）。
+
+    用于判断是否触发 LLM 压缩器（超过 ``prompts.COMPRESS_TRIGGER_TOTAL``）。
+    """
+    if not isinstance(snapshot, dict):
+        return 0
+    layers = snapshot.get("layers")
+    layers = layers if isinstance(layers, dict) else {}
+    total = 0
+    for key in prompts.LAYER_KEYS:
+        total += len(_as_list(layers.get(key)))
+    total += len(_as_list(snapshot.get(prompts.SAMPLE_KEY)))
+    total += len(_as_list(snapshot.get("uncertainty")))
+    return total
+
+
 def merge_snapshot(
     existing: Optional[dict[str, Any]],
     analysis: dict[str, Any],
@@ -379,7 +482,86 @@ def merge_snapshot(
         meta.update(meta_patch)
     snap["meta"] = meta
 
-    return snap
+    # 兜底层：merge 结果永远有界（每层 / samples / uncertainty 都封顶）
+    return cap_snapshot(snap)
+
+
+def rehydrate_compressed(
+    existing: dict[str, Any],
+    compressed: dict[str, Any],
+    corrections: list[str],
+) -> dict[str, Any]:
+    """把 LLM 压缩器返回的 JSON 规整回内部快照格式。
+
+    与 :func:`merge_snapshot` 的区别：压缩器输出的是「合并精简后的全量结果」，
+    因此这里**整体替换**各层内容，而不是做增量去重。规整细节：
+
+    - 每个条目用 :func:`_coerce_item` + :func:`_with_optional_fields` 规整，
+      并保留压缩器给的 ``evidence``（int，缺省 1）与 ``conflict``；
+    - ``speech_samples`` 用 :func:`_coerce_sample`；
+    - ``uncertainty`` 用 ``_as_list`` + str；
+    - ``corrections`` 用调用方传入值（权威，绝不采信 LLM 输出）；
+    - ``meta`` 复制 ``existing`` 的 meta，并 ``compress_count`` 自增 1；
+    - 最后再跑一次 :func:`cap_snapshot` 做兜底。
+
+    Args:
+        existing: 压缩前的完整快照（提供 meta）。
+        compressed: LLM 压缩器返回的 JSON（结构同分析阶段）。
+        corrections: 当前全部人工纠正条目。
+
+    Returns:
+        规整后的新快照 dict。
+    """
+    snap = empty_snapshot()
+    if isinstance(existing, dict) and isinstance(existing.get("meta"), dict):
+        snap["meta"].update(existing["meta"])
+
+    if isinstance(compressed, dict):
+        comp_layers = compressed.get("layers")
+        if not isinstance(comp_layers, dict):
+            comp_layers = compressed  # 压缩器输出为平铺的 5 层 key（与分析阶段一致）
+        for key in prompts.LAYER_KEYS:
+            cleaned: list[dict[str, Any]] = []
+            for raw in _as_list(comp_layers.get(key)):
+                item = _coerce_item(raw)
+                if item is None:
+                    continue
+                if isinstance(raw, dict):
+                    try:
+                        item["evidence"] = int(raw.get("evidence", 1) or 1)
+                    except (TypeError, ValueError):
+                        item["evidence"] = 1
+                _with_optional_fields(item, raw)
+                cleaned.append(item)
+            snap["layers"][key] = cleaned
+
+        samples: list[dict[str, Any]] = []
+        for raw in _as_list(compressed.get(prompts.SAMPLE_KEY)):
+            sample = _coerce_sample(raw)
+            if sample is None:
+                continue
+            if isinstance(raw, dict):
+                try:
+                    sample["evidence"] = int(raw.get("evidence", 1) or 1)
+                except (TypeError, ValueError):
+                    sample["evidence"] = 1
+            samples.append(sample)
+        snap[prompts.SAMPLE_KEY] = samples
+
+        snap["uncertainty"] = [
+            str(u) for u in _as_list(compressed.get("uncertainty")) if str(u).strip()
+        ]
+
+    snap["corrections"] = [str(c) for c in _as_list(corrections)]
+
+    meta = snap.get("meta", {})
+    try:
+        meta["compress_count"] = int(meta.get("compress_count", 0) or 0) + 1
+    except (TypeError, ValueError):
+        meta["compress_count"] = 1
+    snap["meta"] = meta
+
+    return cap_snapshot(snap)
 
 
 def count_formed_layers(snapshot: Optional[dict[str, Any]]) -> int:
@@ -704,6 +886,21 @@ class Distiller:
             },
         )
 
+        # 第二层防御：快照条目总数超标时，用 LLM 压缩器做同义合并精简。
+        # merge_snapshot 末尾已经跑过 cap_snapshot（有界），这里再做语义合并；
+        # 压缩失败则保持 merge 结果（依然有界），绝不因压缩器出错而丢档案。
+        if bool(self.config.get("auto_compress", True)) and snapshot_item_count(
+            merged
+        ) > prompts.COMPRESS_TRIGGER_TOTAL:
+            compressed = await self._compress(provider, merged, spec.nickname, qq)
+            if compressed is not None:
+                merged = rehydrate_compressed(merged, compressed, corrections)
+            else:
+                logger.warning(
+                    "[%s] 压缩器失败，已回退确定性裁剪（cap_snapshot 兜底）。",
+                    self.plugin_name,
+                )
+
         await self.storage.save_persona(group_id, qq, merged)
         await self.storage.mark_distilled([int(r["id"]) for r in records])
         # mark 之后重新读真实剩余量，避免沿用 mark 前的旧计数缓存
@@ -894,3 +1091,29 @@ class Distiller:
             or getattr(resp, "text", "")
             or ""
         )
+
+    async def _compress(
+        self, provider: Any, snapshot: dict[str, Any], nickname: str, qq: str
+    ) -> Optional[dict[str, Any]]:
+        """调用 LLM 压缩器，把膨胀的快照做语义合并精简。
+
+        Args:
+            provider: LLM Provider。
+            snapshot: 待压缩的完整快照。
+            nickname: 目标昵称。
+            qq: 目标 QQ。
+
+        Returns:
+            压缩器返回的 JSON dict；解析失败或返回非 dict 时返回 None（调用方
+            回退到确定性的 :func:`cap_snapshot` 裁剪，绝不抛异常）。
+        """
+        try:
+            user_prompt = prompts.build_compressor_user(snapshot, nickname, qq)
+            text = await self._chat(provider, prompts.COMPRESSOR_SYSTEM, user_prompt)
+            data = parse_analysis(text)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception as exc:  # noqa: BLE001 - 压缩失败必须回退而非崩溃
+            logger.warning("[%s] 压缩器调用异常: %s", self.plugin_name, exc)
+            return None

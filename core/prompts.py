@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any, Optional, Sequence
@@ -69,6 +70,18 @@ ITEM_OPTIONAL_FIELDS = ("trigger", "avoid")
 
 # 场景应答样例的条数上限（防止快照无限膨胀）
 MAX_SPEECH_SAMPLES = 40
+
+# 每层结论条数硬上限（防多轮蒸馏无限膨胀；超出时按 evidence/confidence 保留）
+MAX_ITEMS_PER_LAYER = 16
+
+# uncertainty 条数上限
+MAX_UNCERTAINTY = 12
+
+# 快照条目总数（5 层 + speech_samples + uncertainty）超过此值触发 LLM 压缩器
+COMPRESS_TRIGGER_TOTAL = 90
+
+# 压缩器每层目标条数（写进压缩器提示词）
+COMPRESS_TARGET_PER_LAYER = 10
 
 # --------------------------------------------------------------------------- #
 # 提示词常量
@@ -176,6 +189,38 @@ MERGE_SYSTEM = """你是人格档案的增量合并器。你会拿到「已有 P
 4. 语言风格类结论优先保留在 Layer 3；行为模式类结论优先保留在 Layer 4。
 5. 输出严格 JSON，结构与输入一致，禁止输出 JSON 之外的任何文字。
 """
+
+# 压缩器系统提示：把多轮增量蒸馏后膨胀的档案做「同义合并 + 精简」。
+# 这是防膨胀的第二层防御（第一层是 cap_snapshot 的确定性上限）。核心约束是
+# 「绝不臆造新事实」+「同义必须合并」+「每层给个上限」，让输出紧凑且仍可照演。
+COMPRESSOR_SYSTEM = (
+    "你是「人格档案压缩器」。你的唯一任务：把经过多轮增量蒸馏后膨胀的人格档案做"
+    "同义合并与精简，输出一份紧凑、仍然可以照着演出来的人格档案。\n\n"
+    "【铁律】\n"
+    "1. 绝不臆造新事实：你输出的每一条结论、每个 evidence、每段 quotes，都必须能在"
+    "输入档案里找到来源；输入里没有的一律不要写。\n"
+    "2. 同义合并：意思相同、只是措辞不同的条目必须合并成一条 —— 取最精炼的表述，"
+    "evidence 累加，quotes 保留最有代表性的 1~3 条。\n"
+    f"3. 精简上限：每个 layer 最多输出 {COMPRESS_TARGET_PER_LAYER} 条；speech_samples "
+    "最多 30 条；uncertainty 合并去重，删掉「本批次未出现 XX」这类同义反复。\n"
+    "4. 输出必须是一个合法 JSON 对象，禁止输出 JSON 之外的任何文字，禁止使用 Markdown "
+    "代码块包裹。\n\n"
+    "【输出 JSON 结构】（与分析阶段完全一致）\n"
+    "{\n"
+    '  "layer1_rules":     [{"text": "硬规则描述", "confidence": 0.0, "evidence": 3, "quotes": ["原话1"], "trigger": "情境", "avoid": "情境", "conflict": true}],\n'
+    '  "layer2_identity":  [{"text": "身份特征", "confidence": 0.0, "evidence": 1, "quotes": ["原话1"]}],\n'
+    '  "layer3_style":     [{"text": "风格特征", "confidence": 0.0, "evidence": 1, "quotes": ["原话1"]}],\n'
+    '  "layer4_behavior":  [{"text": "行为模式", "confidence": 0.0, "evidence": 1, "quotes": ["原话1"]}],\n'
+    '  "layer5_interests": [{"text": "兴趣偏好", "confidence": 0.0, "evidence": 1, "quotes": ["原话1"]}],\n'
+    '  "speech_samples":   [{"situation": "别人问他在干嘛", "reply": "在呢在呢", "evidence": 1, "quotes": ["在呢在呢"]}],\n'
+    '  "uncertainty": ["证据不足的说明1"]\n'
+    "}\n\n"
+    "【字段约定】\n"
+    "- evidence：整数，表示该结论在历轮蒸馏中累积出现的证据次数；合并时累加，缺省 1。\n"
+    "- conflict：布尔，仅当输入档案里已标注冲突时才保留。\n"
+    "- trigger / avoid：可选，中文，一句话。\n"
+    "- 某一层没有条目时输出空数组 []。\n"
+)
 
 # 导出模板：导出的 persona_<qq>.md 骨架说明（实际渲染见 render_export_markdown）。
 EXPORT_TEMPLATE = """# {nickname} 的人格档案
@@ -413,6 +458,98 @@ def build_analyzer_user(
     )
 
 
+def _evidence_of(item: Any) -> int:
+    """从条目/样例里安全取出 ``evidence``（缺省 1）。"""
+    try:
+        return int(item.get("evidence", 1) or 1) if isinstance(item, dict) else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _confidence_of(item: Any) -> float:
+    """从条目里安全取出 ``confidence``（缺省 0.0）。"""
+    if not isinstance(item, dict):
+        return 0.0
+    try:
+        return float(item.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_compressor_user(snapshot: dict[str, Any], nickname: str, qq: str) -> str:
+    """组装压缩器的用户提示词：把快照序列化成紧凑 JSON 作为正文。
+
+    只保留条目的 ``text/confidence/evidence/quotes/trigger/avoid/conflict`` 与
+    样例的 ``situation/reply/evidence/quotes``，丢弃 ``meta`` / ``corrections``，
+    避免把人工纠正层交给 LLM「重写」。
+    """
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    layers = snap.get("layers") if isinstance(snap.get("layers"), dict) else {}
+
+    payload: dict[str, Any] = {}
+    for key in LAYER_KEYS:
+        items: list[dict[str, Any]] = []
+        for it in layers.get(key) or []:
+            if not isinstance(it, dict):
+                continue
+            text = str(it.get("text") or "").strip()
+            if not text:
+                continue
+            entry: dict[str, Any] = {
+                "text": text,
+                "confidence": _confidence_of(it),
+                "evidence": _evidence_of(it),
+                "quotes": [
+                    str(q).strip()
+                    for q in (it.get("quotes") or [])
+                    if str(q).strip()
+                ][:3],
+            }
+            if it.get("conflict"):
+                entry["conflict"] = True
+            for field in ITEM_OPTIONAL_FIELDS:
+                value = str(it.get(field) or "").strip()
+                if value:
+                    entry[field] = value[:120]
+            items.append(entry)
+        payload[key] = items
+
+    samples: list[dict[str, Any]] = []
+    for s in snap.get(SAMPLE_KEY) or []:
+        if not isinstance(s, dict):
+            continue
+        situation = str(s.get("situation") or "").strip()
+        reply = str(s.get("reply") or "").strip()
+        if not situation and not reply:
+            continue
+        samples.append(
+            {
+                "situation": situation[:120],
+                "reply": reply[:300],
+                "evidence": _evidence_of(s),
+                "quotes": [
+                    str(q).strip() for q in (s.get("quotes") or []) if str(q).strip()
+                ][:3],
+            }
+        )
+    payload[SAMPLE_KEY] = samples
+    payload["uncertainty"] = [
+        str(u).strip() for u in (snap.get("uncertainty") or []) if str(u).strip()
+    ]
+
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    display = (nickname or "").strip() or "群友"
+    note = (
+        f"请把下面这份「{display}」（QQ：{qq or '未知'}）的人格档案做同义合并与精简。\n"
+        "规则：意思相同、只是措辞不同的条目合并成一条（取最精炼表述，evidence 累加，"
+        f"quotes 留 1~3 条）；每个 layer 最多保留 {COMPRESS_TARGET_PER_LAYER} 条；"
+        "speech_samples 最多 30 条；uncertainty 合并去重。绝不臆造新事实，"
+        "所有输出都要能在下面档案里找到来源。\n\n"
+        "【当前档案 JSON】\n"
+    )
+    return note + body
+
+
 def render_export_markdown(
     snapshot: Optional[dict[str, Any]],
     nickname: str,
@@ -571,8 +708,21 @@ def _persona_bullets(
     if not items:
         return [f"- {fallback}"]
 
+    # 渲染端兜底截断：历史已膨胀的旧快照在渲染时也别爆掉。先按
+    # (evidence, confidence) 降序选出 keep 索引，再按原顺序过滤，保持相对顺序。
+    items_list: list[Any] = list(items)
+    total = len(items_list)
+    if total > MAX_ITEMS_PER_LAYER:
+        keep = sorted(
+            range(total),
+            key=lambda i: (_evidence_of(items_list[i]), _confidence_of(items_list[i])),
+            reverse=True,
+        )[: MAX_ITEMS_PER_LAYER]
+        keep_set = set(keep)
+        items_list = [it for i, it in enumerate(items_list) if i in keep_set]
+
     lines: list[str] = []
-    for item in items:
+    for item in items_list:
         if isinstance(item, dict):
             text = str(item.get("text") or "").strip()
             if not text:
@@ -595,6 +745,9 @@ def _persona_bullets(
             value = str(item.get(field) or "").strip() if isinstance(item, dict) else ""
             if value:
                 lines.append(f"  · {label}：{value}")
+
+    if total > MAX_ITEMS_PER_LAYER:
+        lines.append(f"- （已省略 {total - len(items_list)} 条低证据条目，见 /zl export）")
 
     return lines or [f"- {fallback}"]
 
@@ -701,10 +854,26 @@ def render_layer_block(
 
 
 def render_samples_block(samples: Sequence[Any]) -> str:
-    """渲染场景应答样例块。"""
-    lines = _persona_samples(samples)
+    """渲染场景应答样例块（超出上限时按 evidence 截断）。"""
+    if not samples:
+        return "- （还没有攒到足够的应答样例，按上面的说话习惯自由发挥。）"
+
+    samples_list: list[Any] = list(samples)
+    total = len(samples_list)
+    if total > MAX_SPEECH_SAMPLES:
+        keep = sorted(
+            range(total),
+            key=lambda i: _evidence_of(samples_list[i]),
+            reverse=True,
+        )[: MAX_SPEECH_SAMPLES]
+        keep_set = set(keep)
+        samples_list = [s for i, s in enumerate(samples_list) if i in keep_set]
+
+    lines = _persona_samples(samples_list)
     if not lines:
         return "- （还没有攒到足够的应答样例，按上面的说话习惯自由发挥。）"
+    if total > MAX_SPEECH_SAMPLES:
+        lines.append(f"- （已省略 {total - len(samples_list)} 条低证据样例，见 /zl export）")
     return "\n".join(lines)
 
 
@@ -725,11 +894,17 @@ def render_extra_rules_block(extra_rules: str) -> str:
 
 
 def render_uncertainty_block(uncertainty: Sequence[Any]) -> str:
-    """渲染「留个心」块。"""
+    """渲染「留个心」块（超出上限时截断）。"""
     items = [str(u).strip() for u in (uncertainty or []) if str(u).strip()]
-    if items:
-        return "\n".join(f"- {u}" for u in items)
-    return "- （暂无，目前的结论都有足够证据支撑。）"
+    if not items:
+        return "- （暂无，目前的结论都有足够证据支撑。）"
+    total = len(items)
+    if total > MAX_UNCERTAINTY:
+        items = items[:MAX_UNCERTAINTY]
+    lines = [f"- {u}" for u in items]
+    if total > MAX_UNCERTAINTY:
+        lines.append(f"- （已省略 {total - len(items)} 条不确定项，见 /zl export）")
+    return "\n".join(lines)
 
 
 def render_meta_block(

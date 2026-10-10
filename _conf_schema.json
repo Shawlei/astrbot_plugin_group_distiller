@@ -57,6 +57,12 @@
     "hint": "某个目标的语料攒够了就自动喊一次 LLM 蒸馏。想省 token 就关掉，改成手动 /zl distill。",
     "default": true
   },
+  "auto_compress": {
+    "type": "bool",
+    "description": "档案过大时自动压缩精简",
+    "hint": "蒸馏档案过大时自动压缩精简（合并语义重复条目、限制每层条数），默认开启。多轮蒸馏后人格档案不会无限膨胀，导出的人格模板也不会超长。",
+    "default": true
+  },
   "distill_interval_messages": {
     "type": "int",
     "description": "自动蒸馏触发条数",

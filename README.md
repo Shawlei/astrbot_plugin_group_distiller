@@ -392,6 +392,34 @@
 
 ---
 
+## 🗜️ 档案自动压缩（防多轮蒸馏膨胀）
+
+多轮增量蒸馏会让同一特征以不同措辞反复出现，人格快照会越攒越大。为避免导出的人格模板超长（曾出现 19 轮后 600+ 行 / 近 3 万字符），插件做了**两层防御 + 渲染端截断**：
+
+**第 1 层 · 确定性上限（永远生效，纯 Python）**
+
+每次 `merge_snapshot` 合并完都会跑一次 `cap_snapshot`，把快照钉死在上限内：
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `MAX_ITEMS_PER_LAYER` | 16 | 每个 layer 最多保留 16 条结论（按 evidence/confidence 从高到低保留） |
+| `MAX_SPEECH_SAMPLES` | 40 | 场景应答样例最多 40 条 |
+| `MAX_UNCERTAINTY` | 12 | 不确定项先按文本去重，再保留 12 条 |
+| `COMPRESS_TRIGGER_TOTAL` | 90 | 快照条目总数（5 层 + 样例 + 不确定项）超过此值触发压缩器 |
+| `COMPRESS_TARGET_PER_LAYER` | 10 | 压缩器每层目标条数 |
+
+**第 2 层 · LLM 压缩器（主路径，可用配置关闭）**
+
+当快照条目总数超过 `COMPRESS_TRIGGER_TOTAL` 时，会再调一次 LLM，把整份档案做**同义合并 + 精简**：意思相同只是措辞不同的条目合并成一条（evidence 累加、quotes 保留最有代表性的 1~3 条），绝不臆造新事实。压缩失败时自动回退到第 1 层的确定性裁剪，不会丢档案。
+
+- 开关：`auto_compress`（默认 `true`）。关掉后只保留第 1 层的确定性上限，不再额外调用 LLM 压缩。
+
+**渲染端截断**
+
+即便历史已经膨胀的旧快照，在渲染人格模板时也会被截断：每层最多 16 条、样例 40 条、不确定项 12 条，超出部分显示一行「已省略 N 条…，见 /zl export」；完整内容仍可通过 `/zl export` 导出查看。
+
+---
+
 ## 🗂️ 目录结构
 
 ```
@@ -421,7 +449,8 @@ astrbot_plugin_group_distiller/
     ├── test_targets_persona.py   # 多目标 / 人格模板
     ├── test_daily_digest.py      # 每日定时总结
     ├── test_detail_persona.py    # 蒸馏细节 / 人格同步 / 模板填充
-    └── test_persona_templates.py # 人设模板（内置三套 + 自定义）
+    ├── test_persona_templates.py # 人设模板（内置三套 + 自定义）
+    └── test_compression.py       # 人格快照自动压缩 / 每层条目上限
 ```
 
 跑测试（无需 AstrBot 环境、无需 pytest）：
@@ -433,6 +462,7 @@ python tests/test_targets_persona.py   # 33/33
 python tests/test_daily_digest.py      # 28/28
 python tests/test_detail_persona.py    # 18/18
 python tests/test_persona_templates.py # 15/15
+python tests/test_compression.py       # 7/7
 ```
 
 数据落盘位置（遵循 AstrBot 规范，数据放 data 目录）：
